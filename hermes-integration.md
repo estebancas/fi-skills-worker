@@ -19,7 +19,26 @@ You cannot run scripts, transcribe video, or read the knowledge vault yourself. 
 live on a Mac that is not always online. You reach them by putting a job on a queue; a
 worker on the Mac picks it up and does the work.
 
-You have three tools: enqueue_job, job_status, list_jobs.
+You have three tools for running work: enqueue_job, job_status, list_jobs. You have three
+more for reading what has already been saved: search_notes, list_notes, get_note.
+
+Search before you transcribe. If the user asks about a video, or gives you a URL, call
+search_notes first — re-transcribing something already in the vault wastes minutes of GPU
+and produces the note that is already there.
+
+The catalog holds each note's metadata and its summary. It does NOT hold the transcript
+itself. So you can say which note covers a topic and what its summary says, and you can
+quote the summary. You cannot quote what was said in the video. If the user needs exact
+wording, say the transcript is on the Mac and is not searchable yet — do not paraphrase
+and present it as a quote.
+
+A result with has_summary false has never been summarised, so only its title was
+searchable. If it looks relevant, offer to summarise it: enqueue summarize_transcript
+with its path.
+
+The catalog lives on this machine, so search works even when the Mac is offline. It is
+refreshed when the Mac is awake, so a note added in the last hour while the Mac was
+asleep may not be there yet.
 
 Job types are declared by the worker, not by you. Call list_jobs (or read the published
 manifest) rather than guessing a type or a parameter name. Currently:
@@ -161,6 +180,118 @@ republishes.
 
 ---
 
+## 2b. The catalog — what to build on the VPS
+
+The Mac worker already pushes this; the queue side does not exist yet. Until it does, the
+worker gets a 404, logs one line, and carries on — nothing breaks, search just does not
+work.
+
+**Check FTS5 first.** The whole design assumes it:
+
+```bash
+/home/dev/queue/.venv/bin/python3 -c "import sqlite3;sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(a)');print('ok')"
+```
+
+Present on the Mac (sqlite 3.50.4, porter + bm25 + snippet). If the VPS build lacks it,
+fall back to `LIKE` scanning — at a few hundred rows nothing is lost but ranking and
+snippets.
+
+### Schema — same SQLite file as `jobs`, no second datastore
+
+```sql
+CREATE TABLE IF NOT EXISTS notes (
+  path              TEXT PRIMARY KEY,   -- vault-relative: transcripts/abc-title.md
+  worker            TEXT,
+  title             TEXT,
+  channel           TEXT,
+  video_id          TEXT,
+  url               TEXT,
+  upload_date       TEXT,
+  duration_s        INTEGER,
+  transcript_method TEXT,
+  chars             INTEGER,            -- transcript length, so Fi can say how big it is
+  summary           TEXT,
+  summary_style     TEXT,
+  has_summary       INTEGER NOT NULL DEFAULT 0,
+  sha256            TEXT,               -- of the note file; lets pushes skip no-ops
+  modified_at       TEXT,               -- note mtime; order "recent notes" by this
+  updated_at        TEXT                -- when this row was last written
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+  title, channel, summary,
+  content='notes', content_rowid='rowid',
+  tokenize='porter unicode61'
+);
+```
+
+Add the three standard external-content sync triggers (`ai`/`ad`/`au` on `notes`).
+Without them the index silently stops matching new rows — nothing errors, searches just
+come back empty for anything added after you created the table.
+
+Those column names are exactly the keys the worker sends. It never sends the transcript
+body; there is no column for it because there is no field for it.
+
+### `POST /catalog`
+
+```json
+{"worker": "mac", "full": true, "notes": [{"path": "...", "title": "...", ...}]}
+```
+
+- Upsert each row by `path`. Skip the write when `sha256` matches what you have.
+- `full: true` means *this is the complete set for that worker*: delete rows for it that
+  are not in the payload. That is the only way a note deleted in Obsidian leaves the index.
+- `full: false` is a single-note update after a job — upsert only, never delete.
+- Same bearer token as everything else.
+
+### `GET /catalog/search?q=...&limit=5`
+
+```sql
+SELECT n.path, n.title, n.channel, n.url, n.upload_date, n.has_summary,
+       snippet(notes_fts, 2, '**', '**', '…', 20) AS snip,
+       bm25(notes_fts, 5.0, 2.0, 1.0)             AS score
+FROM notes_fts JOIN notes n ON n.rowid = notes_fts.rowid
+WHERE notes_fts MATCH ?
+ORDER BY score LIMIT ?;
+```
+
+Weights: title 5, channel 2, summary 1. **bm25 returns negative numbers — smaller is
+better.** Ascending `ORDER BY score` is correct; `DESC` silently returns the worst matches
+and looks like the search is bad rather than backwards.
+
+**Sanitise `q` before it reaches MATCH.** Raw user text containing `"`, `*`, `AND`, `NEAR`
+or an unbalanced paren is an FTS5 *syntax error*, which reaches Fi as a 500:
+
+```python
+terms = [t.replace('"', "") for t in q.split() if t.strip()]
+match = " OR ".join(f'"{t}"' for t in terms) or '""'
+```
+
+### `GET /catalog?limit=20` and `GET /catalog/note?path=...`
+
+Recent notes ordered by `modified_at`, and one full row including the summary text.
+
+### Three more MCP tools in `queue_mcp.py`
+
+```python
+def search_notes(query: str, limit: int = 5) -> list:
+    """Search saved transcripts by topic. Returns ranked notes with snippets.
+
+    Covers titles and summaries, not transcript text. Call this before
+    enqueueing transcribe_video, to avoid re-transcribing what is already saved.
+    """
+
+def list_notes(limit: int = 20) -> list:
+    """Most recently added or updated notes."""
+
+def get_note(path: str) -> dict:
+    """One note's metadata and its full summary."""
+```
+
+None of them touch the Mac, so they answer while it is asleep.
+
+---
+
 ## 3. VPS checks
 
 ### Verify the queue is not on the public internet
@@ -235,8 +366,17 @@ transition to dead. Silent dead-lettering is how a request disappears with no on
 3. **Enqueue while the Mac is asleep.** The job should sit in `queued`, and drain when the
    Mac wakes. This is the behaviour the whole design exists for.
 
+4. **Ask about a note that already exists** — "do I have anything about pausing AI
+   development?" Fi should call `search_notes` and name the note without enqueueing
+   anything.
+5. **Put the Mac to sleep and ask again.** Same answer, same latency. This is the whole
+   reason the catalog exists.
+
 Watch from the Mac side with:
 
 ```bash
 tail -f ~/Library/Logs/hermes-worker.log
 ```
+
+Once `/catalog` exists, the worker logs `published catalog (N note(s), full)` on startup.
+Before it exists it logs `queue has no /catalog endpoint — skipping`, which is harmless.

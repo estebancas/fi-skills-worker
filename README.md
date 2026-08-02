@@ -22,6 +22,7 @@ You → Fi (VPS, always up) → enqueue_job() → SQLite queue (VPS)
                                     runs the skill, writes the vault
                                                   ↓
                                       POST /jobs/{id}/complete
+                                      POST /catalog   ← searchable index
 ```
 
 Four consequences, and most of the design follows from them:
@@ -46,6 +47,23 @@ Four consequences, and most of the design follows from them:
 Each skill's `skill.yaml` is the authoritative signature. The worker republishes those
 manifests to the queue on startup, so the agent plans against what is actually installed
 rather than against a hardcoded list.
+
+## Finding things again
+
+Creating notes is only half of it — the agent also has to be able to find them, and the
+vault is on a machine it cannot read. So the worker pushes an **index** of the vault to
+the queue: frontmatter plus each note's summary, never the transcript body. The queue
+makes that searchable with SQLite FTS5, which means "do I have anything about X?" is
+answered from the VPS in milliseconds, **including while the Mac is asleep** — the one
+class of request the pull design otherwise handles badly.
+
+It is a read-only replica and it is rebuilt, never merged: a full snapshot on startup and
+hourly, a single row after each job that writes a note. A catalog push that fails is
+logged and dropped; it can never turn a job that succeeded into one that failed.
+
+The consequence to know about: the agent can tell you which note covers a topic and what
+its summary says, but cannot quote the transcript itself. That needs a search skill
+running on the Mac, which is not built yet.
 
 ## Skill contract
 
