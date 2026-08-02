@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from skilllib import notefmt
+
 SKILL = "transcribe_video/run.py"
 
 META = {
@@ -148,36 +150,6 @@ def test_unknown_duration_skips_the_guard(tv):
 
 
 # ---------------------------------------------------------------------------
-# existing_summary — the anti-clobber check
-# ---------------------------------------------------------------------------
-
-def test_existing_summary_absent_file(tv, tmp_path):
-    assert tv.existing_summary(tmp_path / "nope.md") == ""
-
-
-def test_existing_summary_reads_sentinel_block(tv, tmp_path):
-    p = tmp_path / "n.md"
-    p.write_text(f"---\na: b\n---\n\n{tv.SUM_BEGIN}\nKEEP ME\n{tv.SUM_END}\n\nbody", encoding="utf-8")
-    block = tv.existing_summary(p)
-    assert "KEEP ME" in block
-    assert block.startswith(tv.SUM_BEGIN) and block.endswith(tv.SUM_END)
-
-
-def test_existing_summary_wraps_legacy_heading(tv, tmp_path):
-    p = tmp_path / "n.md"
-    p.write_text("---\na: b\n---\n\nbody\n\n## Summary\n\nOLD\n", encoding="utf-8")
-    block = tv.existing_summary(p)
-    assert "OLD" in block
-    assert block.startswith(tv.SUM_BEGIN)
-
-
-def test_existing_summary_none_when_note_has_no_summary(tv, tmp_path):
-    p = tmp_path / "n.md"
-    p.write_text("---\na: b\n---\n\njust a transcript", encoding="utf-8")
-    assert tv.existing_summary(p) == ""
-
-
-# ---------------------------------------------------------------------------
 # write_note
 # ---------------------------------------------------------------------------
 
@@ -202,7 +174,7 @@ def test_write_note_preserves_an_existing_summary(tv):
     dest.write_text(
         dest.read_text(encoding="utf-8").replace(
             "first transcript",
-            f"{tv.SUM_BEGIN}\nMY SUMMARY\n{tv.SUM_END}\n\nfirst transcript",
+            f"{notefmt.SUM_BEGIN}\nMY SUMMARY\n{notefmt.SUM_END}\n\nfirst transcript",
         ),
         encoding="utf-8",
     )

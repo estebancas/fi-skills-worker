@@ -2,8 +2,9 @@
 
 Skills that a worker on this Mac runs on behalf of the **Hermes** agent.
 
-Each subdirectory is one skill: a `run.py` that does the work and a `skill.yaml` that
-declares it to the worker's manifest.
+Each skill subdirectory is a `run.py` that does the work and a `skill.yaml` that declares
+it to the worker's manifest. [skilllib/](skilllib/) is not a skill — it is the code they
+share.
 
 ## Why this exists
 
@@ -60,14 +61,19 @@ must be safe to run twice**. In practice:
 
 ### Untrusted input
 
-`path` and `source` originate from a Telegram message via an LLM. Resolve paths and
-verify they sit under `VAULT` before reading or writing (see `read_note`). Without that
-check, `../../.ssh/id_ed25519` is a readable file.
+`path` and `source` originate from a Telegram message via an LLM.
+
+- **Paths**: resolve and verify they sit under `VAULT` before reading or writing (see
+  `read_note`). Without that check, `../../.ssh/id_ed25519` is a readable file.
+- **URLs**: resolve the host and refuse loopback, RFC-1918, link-local, and `100.64/10`
+  before fetching, and again after redirects (see `guard_host`). Without that check,
+  `http://127.0.0.1:11434` is Ollama and the whole tailnet is reachable.
 
 ## Vault note format
 
-One note per video, holding both the transcript and its summary. Two skills write to the
-same file, so the summary is delimited by sentinels rather than by position:
+One note per source — a video transcript or an article — holding both the source text and
+its summary. Several skills write to the same file, so the summary is delimited by
+sentinels rather than by position:
 
 ```markdown
 ---
@@ -87,8 +93,11 @@ transcript_method: captions:auto
 ...transcript...
 ```
 
-- The summary sits **above** the transcript. Reading a note in Obsidian should not mean
+- The summary sits **above** the source text. Reading a note in Obsidian should not mean
   scrolling past 17k characters of unpunctuated captions.
+- Articles use the same layout with `site`/`url_id`/`published`/`fetch_method` in place of
+  `channel`/`video_id`/`upload_date`/`transcript_method`.
+- All of this lives in [skilllib/notefmt.py](skilllib/notefmt.py). Do not re-implement it.
 - `transcribe_video` lifts the block out before overwriting the note, so re-transcribing
   keeps the summary.
 - `summarize_transcript` strips the block before summarising, so it never summarises its
@@ -150,6 +159,40 @@ If the queue's `/complete` payload shape ever differs from
 `{status, result, error, permanent}`, `complete()` in `worker.py` is the single place to
 change.
 
+## `skilllib/`
+
+Stdlib-only package at the repo root, imported by the skills and by `worker.py`. It exists
+because the note format had been written three times and the Ollama client was about to be
+written twice.
+
+- **`notefmt.py`** — sentinels, `split_summary`, `make_block`, `parse_block`, frontmatter
+  splitting, `slugify`, `atomic_write`, `compose`. Getting this wrong destroys a summary
+  another skill wrote, so it lives in one place.
+- **`llm.py`** — `Config`, `generate`, `check_model`, `chunk`, `summarise`, `STYLES`,
+  `SYSTEMS`.
+
+Two rules it follows, both load-bearing:
+
+- **Nothing reads the environment at import time.** The test suite re-imports skills to
+  pick up patched environments; a shared module is cached in `sys.modules`, so import-time
+  config would freeze the first test's settings into every later one. Configuration is an
+  explicit `llm.Config` built inside `main()`.
+- **It raises `LLMError` rather than calling `sys.exit`.** A library should not decide a
+  process's exit code. Each skill catches it and maps `.permanent` onto the 2/1 contract.
+
+Skills run with their own directory as cwd, so each `run.py` starts with:
+
+```python
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from skilllib import llm, notefmt
+```
+
+`load_skills` globs `*/skill.yaml`, so `skilllib/` is never mistaken for a skill.
+
+`SYSTEMS` holds one system prompt per source kind. The transcript prompt tells the model to
+read through caption noise; the article prompt tells it to ignore navigation and cookie
+banners. Using the transcript prompt on clean prose makes the model hedge, and vice versa.
+
 ## The catalog
 
 The vault is here; Fi is on the VPS and cannot read it. Without something in between, Fi
@@ -164,6 +207,11 @@ path, title, channel, video_id, url, upload_date, duration_s,
 transcript_method, chars, summary, summary_style, has_summary,
 sha256, modified_at
 ```
+
+Articles carry `site`, `url_id`, `published`, and `fetch_method` where videos carry
+`channel`, `video_id`, `upload_date`, and `transcript_method`. `note_row` falls back
+between them, so both shapes land in one index and the VPS schema never learned there are
+two kinds of note.
 
 **The transcript body is not in that list, deliberately.** Fi can find the right note and
 report its summary; it cannot quote what was actually said. Quoting needs a `search_vault`
@@ -201,8 +249,12 @@ are indexed. That is the strongest argument for chaining the two skills.
 ## Dependencies
 
 `.venv/` holds the worker's only third-party dependency, `pyyaml`. The system `python3`
-(3.14.5, `/usr/local/bin`) does not have it. The skills themselves are stdlib-only and
-must stay that way — anything they need goes in this venv and gets documented here.
+(3.14.5, `/usr/local/bin`) does not have it. The skills and `skilllib/` are stdlib-only
+and must stay that way — anything they need goes in this venv and gets documented here.
+
+External binaries they shell out to: `yt-dlp`, `ffmpeg`, `whisper-cli` (Homebrew),
+and `/usr/bin/curl` (system, and the only working HTTPS client here — see *Local
+environment*).
 
 ```bash
 python3 -m venv .venv && .venv/bin/pip install pyyaml
@@ -218,6 +270,7 @@ against, so keep this table and the manifests in step.
 |---|---|---|
 | `transcribe_video` | YouTube URL → note in `$VAULT/transcripts/`. Prefers published captions (manual over auto-generated) and falls back to local whisper only when there are none. Returns `transcript_path`, `method`, `title`, `channel`, `duration_s`, `video_id`, `chars`. | `source` *(required)* — video URL<br>`language` — ISO-639-1 or `auto` *(default `auto`)*<br>`force_whisper` — ignore published captions *(default `false`)*<br>`allow_long` — bypass the duration guard *(default `false`)* |
 | `summarize_transcript` | Vault note → summary, via local Ollama, written back above the transcript. Long transcripts are chunked and map-reduced. Returns `summary`, `summary_path`, `source_path`, `source_chars`, `model`, `chunks`, `style`, `regenerated`. | `path` *(required)* — vault-relative note path<br>`style` — `brief` \| `detailed` \| `bullets` *(default `detailed`)*<br>`model` — override `OLLAMA_MODEL` for one job<br>`write_back` — write into the note *(default `true`)*<br>`force` — redo an existing summary *(default `false`)* |
+| `summarize_url` | Article or blog URL → note in `$VAULT/transcripts/`, summary above the extracted article text. Fetches with curl, extracts with `html.parser`, summarises with Ollama. Returns `note_path`, `url`, `title`, `site`, `chars`, `summary`, `model`, `chunks`, `style`, `regenerated`, `fetched`. | `source` *(required)* — article URL<br>`style` — `brief` \| `detailed` \| `bullets` *(default `detailed`)*<br>`model` — override `OLLAMA_MODEL` for one job<br>`force` — redo an existing summary *(default `false`)*<br>`refetch` — re-download instead of re-using stored text *(default `false`)* |
 
 ### `transcribe_video` — notes
 
@@ -234,6 +287,43 @@ Re-running is a no-op when a summary in the requested style already exists — i
 the existing text with `regenerated: false` in ~50ms, without even probing Ollama. A
 different `style`, or `force: true`, regenerates. This is what makes chaining
 `transcribe_video → summarize_transcript` cheap to re-deliver.
+
+### `summarize_url` — notes
+
+**It fetches with `/usr/bin/curl`, not `urllib`, and that is not a style choice.**
+This machine's Python has no root certificates —
+`ssl.get_default_verify_paths().cafile` is `None` and the framework's cert directory is
+empty — so *every* HTTPS request from it fails `CERTIFICATE_VERIFY_FAILED`. It has never
+surfaced because `transcribe_video` shells out to yt-dlp, which carries its own certs,
+and both Ollama and the queue are plain HTTP. curl uses the macOS system trust store.
+Running `/Applications/Python 3.14/Install Certificates.command` would fix the underlying
+gap, but nothing here depends on it.
+
+No HTML extractor exists on this machine — no pandoc, lynx, trafilatura — so extraction
+is a `html.parser` subclass: drop the furniture (`script`, `nav`, `header`, `footer`,
+`aside`, …), then prefer the **longest** `<article>`, falling back to `<main>` and then
+the whole body. Longest, because index pages wrap every card in its own `<article>`.
+
+Three things worth knowing:
+
+- **`<meta http-equiv="refresh">` is followed manually.** curl's `-L` does not see it, and
+  it usually hides inside `<noscript>` — which the extractor otherwise drops wholesale, so
+  meta tags are read even inside dropped elements. Without this, a moved article extracts
+  to "Click here to be redirected" and gets reported as needing JavaScript.
+- **Under 500 extracted characters is a permanent failure**, not a summary. A single-page
+  app otherwise produces a confident summary of its navigation bar.
+- **The URL is guarded before it is fetched, and again after redirects.** It arrives from
+  a Telegram message via an LLM, so a host resolving to loopback, RFC-1918, link-local, or
+  `100.64/10` is refused — `127.0.0.1:11434` is Ollama and the tailnet is everything else.
+  `ALLOW_PRIVATE_URLS=1` opens it for testing.
+
+X/Twitter is rejected with an explanation rather than half-supported: the free syndication
+endpoint returns a single post with no replies, and the thread needs an authenticated API.
+
+Identity is `sha256(normalised URL)[:11]`, where normalising strips the fragment and
+tracking parameters — so the same article pasted with different campaign tags is one note,
+not three. A style change re-summarises from the stored article text without re-fetching;
+only `refetch: true` goes back to the network.
 
 ## Local environment
 
@@ -257,6 +347,13 @@ Facts about this machine that the code is tuned to. Re-check them before changin
 - Vault at `~/vault`, whisper models at `~/models`.
 - `yt-dlp` and `ffmpeg` must be on `PATH`. Under launchd that is not the login shell's
   `PATH`, so Homebrew paths need setting explicitly in the plist.
+- **Python has no root certificates.** `ssl.get_default_verify_paths().cafile` is `None`
+  and `/Library/Frameworks/Python.framework/Versions/3.14/etc/openssl/certs` is empty, so
+  every HTTPS request from the venv fails `CERTIFICATE_VERIFY_FAILED`. Anything here that
+  reaches the public web goes through `/usr/bin/curl` (system trust store) or a tool that
+  carries its own certs. `/Applications/Python 3.14/Install Certificates.command` fixes it
+  at the source; nothing currently depends on that having been run.
+- No HTML-to-text tool is installed — no pandoc, lynx, w3m, trafilatura, readability.
 
 ## Adding a skill
 
@@ -264,21 +361,24 @@ Facts about this machine that the code is tuned to. Re-check them before changin
 2. Read params from stdin, print one JSON object to stdout, log to stderr, use the exit
    codes above.
 3. Make it re-runnable. Assume it will be delivered twice.
-4. Confine any caller-supplied path to the vault.
-5. Keep `skill.yaml`'s `params` and `produces` in step with `run.py` — the worker
+4. Confine any caller-supplied path to the vault, and any caller-supplied URL to public
+   addresses (`guard_host` in [summarize_url/run.py](summarize_url/run.py)).
+5. Reuse `skilllib` for the note format and the model — do not write a fourth copy. Add
+   the two-line `sys.path` bootstrap at the top of `run.py`.
+6. Keep `skill.yaml`'s `params` and `produces` in step with `run.py` — the worker
    republishes the manifest to Hermes, and that is what Hermes plans against. Stale
    manifests mean Hermes cannot call a param that exists.
-6. Reload the worker so it picks up the new manifest:
+7. Reload the worker so it picks up the new manifest:
    `launchctl bootout gui/$UID/com.hermes.worker && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.hermes.worker.plist`
 
 ## Testing
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python3 -m pytest          # whole suite, ~13s
+.venv/bin/python3 -m pytest          # whole suite, 216 tests, ~20s
 .venv/bin/python3 -m pytest -k skip  # one behaviour
 .venv/bin/pyright                    # type check — same engine as the editor
-.venv/bin/python3 -m pyflakes worker.py */run.py tests/*.py
+.venv/bin/python3 -m pyflakes worker.py skilllib/*.py */run.py tests/*.py
 ```
 
 All three are currently clean, so CI can gate on all three. Keep it that way: a
@@ -289,26 +389,31 @@ things the tests and pyflakes both missed — an unbound `MODEL` global, a `meth
 was `str | None` at a call site typed `str`. `vps/` is excluded because `mcp` is not
 installed here; that file is type-checked in the queue repo where it runs.
 
-`tests/` covers the three scripts. It is hermetic — no network, no Ollama, no yt-dlp, no
+`tests/` covers the three skills, the worker, and `skilllib`. It is hermetic — no network, no Ollama, no yt-dlp, no
 real vault — so it is safe to run anywhere and suitable for CI:
 
-- **Ollama** is mocked at `ollama()`, the single function wrapping the HTTP call. Transport
-  behaviour (num_ctx, keep_alive, 404 → permanent, unreachable → transient) is tested by
-  replacing `urllib.request.urlopen`, not by running a model.
+- **Ollama** is mocked at `llm.generate()`, the single function wrapping the HTTP call.
+  Transport behaviour (num_ctx, keep_alive, 404 → permanent, unreachable → transient) is
+  tested by replacing `urllib.request.urlopen`, not by running a model.
 - **yt-dlp and whisper** are mocked at `run()` / `probe()` / `whisper_transcribe()`.
+- **curl** is mocked at `fetch()`. The extractor is exercised against fixture HTML, which
+  is where the value is — that is the part with no library behind it.
 - **The queue** is a real stdlib `http.server` bound to port 0 in-process (`StubQueue` in
   `conftest.py`), so lease → run → complete is exercised over real HTTP.
 - **Skills the worker runs** are real subprocesses writing to `tmp_path`, so exit-code
   handling is genuinely tested rather than stubbed.
 
-The modules read their config from the environment *at import time*, so the `load` fixture
+The skills read their config from the environment *at import time*, so the `load` fixture
 imports a fresh module per test with the environment already patched. Do not `import` these
 scripts directly in a test — use the fixture, or you get another test's configuration.
+`skilllib` is exempt and imported normally, because it deliberately reads nothing at import
+time; that is what makes it safe to share across a cached `sys.modules`.
 
 What the suite is really protecting, in order of how much a regression would cost:
 
 1. A re-run must never clobber or stack a summary — silent data loss.
-2. A caller-supplied path must not escape the vault — arbitrary file read.
+2. A caller-supplied path must not escape the vault, and a caller-supplied URL must not
+   reach this network — arbitrary file read, and SSRF onto Ollama and the tailnet.
 3. Exit 2 stays permanent and exit 1 stays transient — a poisoned job must not cycle
    forever, and a transient one must not dead-letter.
 4. An existing same-style summary is reused — ~30s of GPU per redundant job.
@@ -335,5 +440,7 @@ mode to watch for is a clobbered summary, which is silent.
   complaints: `nomic-embed-text` (274 MB) in Ollama, vectors beside the FTS5 rows, fused
   by reciprocal rank. Not before — bm25 over titles and summaries is not the bottleneck at
   this size.
-- **`notefmt.py`** — one implementation of the note format, imported by both skills and the
-  worker, retiring three divergent copies.
+- **X/Twitter.** `summarize_url` rejects it. The free syndication endpoint gives one post
+  with no replies; the thread needs the paid API or a logged-in session, and the
+  Chrome-cookie path is already unreliable under launchd.
+- **PDFs.** Rejected by content type. No PDF text extractor is installed either.

@@ -30,6 +30,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
+# Skills run with their own directory as cwd, so put the repo root on the path
+# before importing the shared modules.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from skilllib import notefmt  # noqa: E402
+
 VAULT = Path(os.environ.get("VAULT_DIR", Path.home() / "vault")).expanduser()
 TRANSCRIPTS = VAULT / "transcripts"
 MODEL = os.environ.get(
@@ -286,40 +291,10 @@ def whisper_transcribe(url: str, language: str, tmp: Path) -> str:
 
 # ---------------------------------------------------------------------------
 
-SUM_BEGIN = "<!-- summary:begin -->"
-SUM_END = "<!-- summary:end -->"
-LEGACY_MARK = "\n## Summary\n"
-
-
-def existing_summary(dest: Path) -> str:
-    """Pull the summary block out of a note we are about to overwrite.
-
-    summarize_transcript writes into this same file. At-least-once delivery
-    (an expired lease requeues the job) and re-asking Hermes for a video that
-    already finished both land us here again — without this the summary is
-    silently lost. Sentinels are the current format; the heading is the
-    fallback for notes written before them.
-    """
-    if not dest.is_file():
-        return ""
-    prior = dest.read_text(encoding="utf-8", errors="replace")
-    i = prior.find(SUM_BEGIN)
-    if i != -1:
-        j = prior.find(SUM_END, i)
-        if j != -1:
-            return prior[i:j + len(SUM_END)]
-    i = prior.find(LEGACY_MARK)
-    if i != -1:
-        return f"{SUM_BEGIN}\n{prior[i:].strip()}\n{SUM_END}"
-    return ""
-
-
 def write_note(meta: dict, text: str, method: str, lang: str | None) -> Path:
     TRANSCRIPTS.mkdir(parents=True, exist_ok=True)
     vid = meta.get("id", "unknown")
-    slug = re.sub(r"[^\w\s-]", "", meta.get("title", "untitled"))[:80].strip()
-    slug = re.sub(r"[\s_]+", "-", slug).lower() or "untitled"
-    dest = TRANSCRIPTS / f"{vid}-{slug}.md"
+    dest = TRANSCRIPTS / f"{vid}-{notefmt.slugify(meta.get('title', 'untitled'))}.md"
 
     upload = meta.get("upload_date") or ""
     if len(upload) == 8:
@@ -337,21 +312,15 @@ def write_note(meta: dict, text: str, method: str, lang: str | None) -> Path:
         f"transcript_language: {lang or 'unknown'}",
         f"transcribed_at: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
         "---",
-        "",
     ]
 
-    keep = existing_summary(dest)
+    # summarize_transcript writes into this same file. Without lifting its
+    # block out first, re-transcribing silently destroys the summary.
+    keep = notefmt.existing_summary(dest)
     if keep:
         log("preserving the existing summary block")
-        keep = "\n" + keep + "\n\n"
 
-    # Atomic: at-least-once delivery means this can run twice.
-    with tempfile.NamedTemporaryFile(
-        "w", dir=TRANSCRIPTS, delete=False, encoding="utf-8", suffix=".tmp"
-    ) as tmp:
-        tmp.write("\n".join(front) + keep + text + "\n")
-        staged = tmp.name
-    os.replace(staged, dest)
+    notefmt.atomic_write(dest, notefmt.compose("\n".join(front), keep, text))
     return dest
 
 

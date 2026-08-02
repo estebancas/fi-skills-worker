@@ -43,6 +43,7 @@ Four consequences, and most of the design follows from them:
 |---|---|---|
 | `transcribe_video` | YouTube URL → note in `$VAULT/transcripts/`. Prefers published captions (manual over auto-generated) and falls back to local whisper only when there are none. Returns `transcript_path`, `method`, `title`, `channel`, `duration_s`, `video_id`, `chars`. | `source` *(required)* — video URL<br>`language` — ISO-639-1 or `auto` *(default `auto`)*<br>`force_whisper` — ignore published captions *(default `false`)*<br>`allow_long` — bypass the duration guard *(default `false`)* |
 | `summarize_transcript` | Vault note → summary, via local Ollama, written back above the transcript. Long transcripts are chunked and map-reduced. Returns `summary`, `summary_path`, `source_path`, `source_chars`, `model`, `chunks`, `style`, `regenerated`. | `path` *(required)* — vault-relative note path<br>`style` — `brief` \| `detailed` \| `bullets` *(default `detailed`)*<br>`model` — override `OLLAMA_MODEL` for one job<br>`write_back` — write into the note *(default `true`)*<br>`force` — redo an existing summary *(default `false`)* |
+| `summarize_url` | Article or blog URL → note in `$VAULT/transcripts/`, summary above the extracted article text. Fetched with curl, extracted with `html.parser`, summarised locally. Returns `note_path`, `url`, `title`, `site`, `chars`, `summary`, `model`, `chunks`, `style`, `regenerated`, `fetched`. | `source` *(required)* — article URL<br>`style` — `brief` \| `detailed` \| `bullets` *(default `detailed`)*<br>`model` — override `OLLAMA_MODEL` for one job<br>`force` — redo an existing summary *(default `false`)*<br>`refetch` — re-download instead of re-using the stored text *(default `false`)* |
 
 Each skill's `skill.yaml` is the authoritative signature. The worker republishes those
 manifests to the queue on startup, so the agent plans against what is actually installed
@@ -115,22 +116,24 @@ echo '{"path":"transcripts/some-note.md"}' | .venv/bin/python3 summarize_transcr
 ## Tests
 
 ```bash
-.venv/bin/python3 -m pytest    # 119 tests, ~13s
+.venv/bin/python3 -m pytest    # 216 tests, ~20s
 ```
 
-The suite is hermetic — no network, no Ollama, no yt-dlp, no real vault — so it runs
-anywhere and gates CI alongside `pyflakes` and `pyright`. Ollama is mocked at the single
-function wrapping its HTTP call; the queue is a real `http.server` on an ephemeral port;
-the skills the worker executes are real subprocesses, so exit-code handling is genuinely
-exercised rather than stubbed.
+The suite is hermetic — no network, no Ollama, no yt-dlp, no curl, no real vault — so it
+runs anywhere and gates CI alongside `pyflakes` and `pyright`. Ollama and curl are each
+mocked at the single function wrapping their call; the queue is a real `http.server` on an
+ephemeral port; the skills the worker executes are real subprocesses, so exit-code handling
+is genuinely exercised rather than stubbed.
 
 ## Layout
 
 ```
-worker.py                 poll → lease → run → heartbeat → complete
+worker.py                 poll → lease → run → heartbeat → complete, and the catalog push
 com.hermes.worker.plist   LaunchAgent template (token-free)
+skilllib/                 note format + Ollama client, shared by the skills
 transcribe_video/         run.py + skill.yaml
 summarize_transcript/     run.py + skill.yaml
+summarize_url/            run.py + skill.yaml
 tests/                    pytest suite + fixtures
 hermes-integration.md     wiring the agent side: MCP tools, prompt, VPS checks
 CLAUDE.md                 design notes, environment specifics, conventions

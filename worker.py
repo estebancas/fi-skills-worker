@@ -35,7 +35,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import signal
 import subprocess
 import sys
@@ -48,6 +47,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
+
+from skilllib import notefmt
 
 HERE = Path(__file__).resolve().parent
 
@@ -223,64 +224,46 @@ def publish_manifest(skills: dict[str, dict]) -> None:
 # questions ("do I have anything about X?") are then answerable while this
 # machine is asleep, which is the one thing the pull design handles badly.
 #
-# The note format is parsed here a third time (both skills also parse it).
-# The duplication is deliberate and bounded: this copy only ever *reads*, so
-# its worst failure is a missing catalog row, corrected by the next reconcile.
-# The skills' copies guard against clobbering a summary, which is not
-# recoverable — do not merge the two without moving all three to a shared
-# module.
+# The note format itself lives in skilllib.notefmt, shared with the skills —
+# this module only ever *reads* notes, and never writes one.
 # ---------------------------------------------------------------------------
-
-SUM_BEGIN = "<!-- summary:begin -->"
-SUM_END = "<!-- summary:end -->"
-LEGACY_MARK = "\n## Summary\n"
-BLOCK_META = re.compile(
-    r"<!--\s*generated\s+(\S+)\s+by\s+(\S+)(?:\s+style=(\w+))?\s*-->"
-)
 
 _catalog_unsupported = False
 
 
 def split_front(text: str) -> tuple[dict | None, str]:
-    """Return (frontmatter, body). Frontmatter is None if this isn't a note."""
-    if not text.startswith("---"):
-        return None, text
-    end = text.find("\n---", 3)
-    if end == -1:
+    """Return (parsed frontmatter, body). Frontmatter is None if not a note.
+
+    notefmt.split_frontmatter returns the raw block, because the skills are
+    stdlib-only and have no YAML parser. The worker does, so it parses.
+    """
+    front, body = notefmt.split_frontmatter(text)
+    if not front:
         return None, text
     try:
-        front = yaml.safe_load(text[3:end])
+        data = yaml.safe_load(front.strip().strip("-"))
     except yaml.YAMLError:
         return None, text
-    if not isinstance(front, dict):
+    if not isinstance(data, dict):
         return None, text
-    return front, text[end + 4:].lstrip("\n")
-
-
-def strip_summary(body: str) -> tuple[str, str]:
-    """Return (transcript, summary block). Mirrors split_summary in the skills."""
-    i = body.find(SUM_BEGIN)
-    if i != -1:
-        j = body.find(SUM_END, i)
-        if j != -1:
-            j += len(SUM_END)
-            return (body[:i] + body[j:]).strip(), body[i:j]
-    i = body.find(LEGACY_MARK)
-    if i != -1:
-        return body[:i].strip(), body[i:]
-    return body.strip(), ""
+    return data, body.lstrip("\n")
 
 
 def parse_summary(block: str) -> tuple[str | None, str]:
-    """Return (style, summary text). Style is None on blocks written before
-    it was stamped, and on the pre-sentinel layout."""
+    """Return (style, summary text), tolerating blocks with no style stamp.
+
+    notefmt.parse_block gives up without the stamp because a skill needs to
+    know whether to regenerate. The catalog would rather index unstamped prose
+    than nothing, so it falls back to stripping the markers.
+    """
     if not block:
         return None, ""
-    meta = BLOCK_META.search(block)
-    text = block[meta.end():] if meta else block
-    for marker in (SUM_BEGIN, SUM_END, "## Summary"):
-        text = text.replace(marker, "")
-    return (meta.group(3) if meta else None), text.strip()
+    style, text = notefmt.parse_block(block)
+    if text:
+        return style, text
+    for marker in (notefmt.SUM_BEGIN, notefmt.SUM_END, "## Summary"):
+        block = block.replace(marker, "")
+    return None, block.strip()
 
 
 def _text(value) -> str | None:
@@ -306,18 +289,22 @@ def note_row(path: Path) -> dict | None:
     except (ValueError, OSError):
         return None
 
-    transcript, block = strip_summary(body)
+    transcript, block = notefmt.split_summary(body)
     style, summary = parse_summary(block)
     duration = front.get("duration_s")
+    # Articles carry site/url_id/published where videos carry
+    # channel/video_id/upload_date. One index, either shape.
     return {
         "path": rel,
         "title": str(front.get("title") or path.stem),
-        "channel": _text(front.get("channel")),
-        "video_id": _text(front.get("video_id")),
+        "channel": _text(front.get("channel") or front.get("site")),
+        "video_id": _text(front.get("video_id") or front.get("url_id")),
         "url": _text(front.get("url")),
-        "upload_date": _text(front.get("upload_date")),
+        "upload_date": _text(front.get("upload_date") or front.get("published")),
         "duration_s": duration if isinstance(duration, int) else None,
-        "transcript_method": _text(front.get("transcript_method")),
+        "transcript_method": _text(
+            front.get("transcript_method") or front.get("fetch_method")
+        ),
         "chars": len(transcript),
         "summary": summary,
         "summary_style": style,

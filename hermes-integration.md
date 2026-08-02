@@ -1,7 +1,7 @@
 # Wiring Hermes to the queue
 
-What Hermes needs in order to use the Mac worker: three tools, a block of instructions,
-and a few VPS-side checks.
+What Hermes needs in order to use the Mac worker: six tools, a block of instructions, and
+a few VPS-side checks.
 
 Written from the Mac side — I can see the worker, the queue's HTTP surface, and the skill
 manifests, but not Hermes' own code. Adapt the tool bodies to whatever framework it uses.
@@ -48,7 +48,26 @@ manifest) rather than guessing a type or a parameter name. Currently:
 
   summarize_transcript   path (vault-relative, required), style, model, write_back, force
                          -> summary, summary_path, source_chars, chunks, regenerated
-                         style is one of: brief, detailed, bullets
+
+  summarize_url          source (URL, required), style, model, force, refetch
+                         -> note_path, url, title, site, chars, summary, chunks,
+                            regenerated, fetched
+
+  style is one of: brief, detailed, bullets
+
+Pick the job type from the kind of link, not from what the user says they want:
+
+  YouTube (or any video host)  -> transcribe_video, then summarize_transcript on the
+                                  transcript_path it returns
+  any other web page           -> summarize_url, which fetches and summarises in one job
+
+summarize_url handles articles, blog posts, and documentation. It does NOT handle
+X/Twitter: it rejects those with an explanation, because the public endpoint returns a
+single post without its replies. Do not retry an X link or try to work around it — say
+that thread capture is not supported and offer to save an article instead.
+
+A page that renders its content with JavaScript fails permanently, saying so. That is not
+a transient error and re-enqueueing will not fix it.
 
 After enqueueing, poll job_status for about 20 seconds.
 
@@ -64,9 +83,9 @@ A failed job comes back with an error. If it is marked permanent, do not re-enqu
 same job: it will fail identically. Report the error and stop. Transient failures are
 retried by the queue on their own; do not enqueue a duplicate.
 
-Both skills are safe to run twice, so re-asking is cheap. In particular, asking to
-summarize a note that already has a summary in that style returns the existing text in
-milliseconds without re-running the model. Only pass force=true when the user explicitly
+Every skill is safe to run twice, so re-asking is cheap. In particular, asking to
+summarize a note or a URL that already has a summary in that style returns the existing
+text in milliseconds, without re-running the model and without re-fetching the page. Only pass force=true when the user explicitly
 asks to redo or regenerate a summary. Asking for a different style is not a redo — pass
 the style and let the skill decide.
 
@@ -74,8 +93,9 @@ To transcribe and then summarize, enqueue transcribe_video first, wait for it to
 then enqueue summarize_transcript with the transcript_path it returned. Do not construct
 that path yourself.
 
-Paths are confined to the vault. A request that points outside it will be rejected, which
-is intended — do not try to work around it.
+Paths are confined to the vault, and URLs are confined to public addresses. A request
+pointing outside the vault, or at a private or loopback address, is rejected on purpose —
+do not try to work around it.
 ```
 
 ---
