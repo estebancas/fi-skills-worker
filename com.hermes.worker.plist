@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hermes Mac worker.
+
+  Install:
+      cp com.hermes.worker.plist ~/Library/LaunchAgents/
+      chmod 600 ~/Library/LaunchAgents/com.hermes.worker.plist
+      launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.hermes.worker.plist
+
+  Reload after editing:
+      launchctl bootout gui/$UID/com.hermes.worker
+      launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.hermes.worker.plist
+
+  Fill in QUEUE_URL and QUEUE_TOKEN below. The token sits in this file in clear
+  text, so keep it mode 600 and out of version control.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hermes.worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/oredrok/skills-worker/.venv/bin/python3</string>
+        <string>/Users/oredrok/skills-worker/worker.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/oredrok/skills-worker</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- Standard, not Background: Background throttles CPU and I/O, which would
+         make whisper crawl. -->
+    <key>ProcessType</key>
+    <string>Standard</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/oredrok/Library/Logs/hermes-worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/oredrok/Library/Logs/hermes-worker.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd does not inherit the login shell's PATH. Without this,
+             yt-dlp and ffmpeg are simply not found. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+
+        <!-- Queue service on ubuntu-8gb-hel1-2, over Tailscale. Confirmed
+             listening and enforcing auth (returns 401 without a token). -->
+        <key>QUEUE_URL</key>
+        <string>http://100.71.182.71:8080</string>
+
+        <!-- ==== the only thing left to fill in ====
+             Edit the INSTALLED copy in ~/Library/LaunchAgents/, not this one.
+             This file stays token-free so it is safe to commit and re-copy. -->
+        <key>QUEUE_TOKEN</key>
+        <string>REPLACE_ME</string>
+        <!-- ======================================== -->
+
+        <!-- Sends: Authorization: Bearer <token>
+             Set QUEUE_AUTH_SCHEME to an empty string to send the raw token. -->
+        <key>QUEUE_AUTH_HEADER</key>
+        <string>Authorization</string>
+        <key>QUEUE_AUTH_SCHEME</key>
+        <string>Bearer</string>
+
+        <key>WORKER_NAME</key>
+        <string>mac</string>
+        <key>SKILLS_DIR</key>
+        <string>/Users/oredrok/skills-worker</string>
+        <key>POLL_WAIT</key>
+        <string>30</string>
+        <key>HEARTBEAT_INTERVAL</key>
+        <string>30</string>
+        <key>JOB_TIMEOUT</key>
+        <string>1800</string>
+
+        <!-- Set to 0 once you know the queue has no /manifest endpoint. -->
+        <key>PUBLISH_MANIFEST</key>
+        <string>auto</string>
+
+        <key>VAULT_DIR</key>
+        <string>/Users/oredrok/vault</string>
+        <key>WHISPER_MODEL</key>
+        <string>/Users/oredrok/models/ggml-base.en.bin</string>
+
+        <key>OLLAMA_URL</key>
+        <string>http://127.0.0.1:11434</string>
+        <key>OLLAMA_MODEL</key>
+        <string>gpt-oss:latest</string>
+        <key>OLLAMA_NUM_CTX</key>
+        <string>32768</string>
+        <key>OLLAMA_KEEP_ALIVE</key>
+        <string>30m</string>
+
+        <!-- yt-dlp cookies. --cookies-from-browser needs a Keychain unlock to
+             decrypt Chrome's cookie DB, which a launchd job usually cannot get:
+             it fails as a YouTube "confirm you're not a bot" error. If that
+             happens, export cookies.txt and switch to COOKIES_FILE instead.
+        <key>COOKIES_FILE</key>
+        <string>/Users/oredrok/.hermes/credentials/cookies.txt</string>
+        -->
+        <key>COOKIES_FROM_BROWSER</key>
+        <string>chrome</string>
+
+        <!-- Optional push notifications on permanent failures. -->
+        <key>NTFY_TOPIC</key>
+        <string></string>
+    </dict>
+</dict>
+</plist>

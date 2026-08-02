@@ -1,0 +1,49 @@
+# ~/skills-worker/summarize_transcript/skill.yaml
+
+type: summarize_transcript
+
+summary: >
+  Summarise a transcript note already in the vault using a local LLM, and
+  return the summary text directly. Long transcripts are chunked and
+  map-reduced automatically. By default the summary is also written into the
+  note itself, under a "## Summary" heading above the transcript. A note that
+  already has a summary in the requested style is returned as-is rather than
+  re-summarised.
+
+params:
+  type: object
+  required: [path]
+  properties:
+    path:
+      type: string
+      description: >
+        Path to the note, absolute or relative to the vault root — e.g.
+        "transcripts/pGro_uKt-_M-some-title.md". Usually the transcript_path
+        returned by a previous transcribe_video job.
+    style:
+      type: string
+      enum: [brief, detailed, bullets]
+      default: detailed
+      description: brief = 3-5 sentences, detailed = 250-400 words, bullets = key takeaways
+    model:
+      type: string
+      description: Override the default Ollama model for this one job
+    write_back:
+      type: boolean
+      default: true
+      description: Write the summary into the source note
+    force:
+      type: boolean
+      default: false
+      description: >
+        Re-summarise even when the note already carries a summary in this
+        style. Without it, an existing summary is returned unchanged.
+
+produces:
+  [summary, summary_path, source_path, source_chars, model, chunks, style, regenerated]
+
+typical_duration_s: 90   # ~0 when an existing summary is reused
+
+idempotent: true
+
+run: ["/usr/bin/env", "python3", "run.py"]

@@ -1,0 +1,40 @@
+# ~/skills-worker/transcribe_video/skill.yaml
+
+type: transcribe_video
+
+summary: >
+  Transcribe a YouTube (or other yt-dlp-supported) video into the knowledge
+  vault as a markdown note with frontmatter. Uses the video's existing
+  captions when available; falls back to local whisper transcription only
+  when the video has none. Refuses videos too long to finish inside the job
+  timeout unless allow_long is set.
+
+params:
+  type: object
+  required: [source]
+  properties:
+    source:
+      type: string
+      description: Video URL
+    language:
+      type: string
+      default: auto
+      description: ISO 639-1 code, or "auto" to prefer English then the video's own language
+    force_whisper:
+      type: boolean
+      default: false
+      description: Ignore published captions and transcribe the audio locally
+    allow_long:
+      type: boolean
+      default: false
+      description: >
+        Proceed even when the estimated transcription time exceeds the job
+        timeout. Only meaningful alongside a raised JOB_TIMEOUT.
+
+produces: [transcript_path, method, title, channel, duration_s, video_id, chars]
+
+typical_duration_s: 20   # captions path; whisper fallback is far slower
+
+idempotent: true
+
+run: ["/usr/bin/env", "python3", "run.py"]

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A new push supersedes an in-flight run on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the interpreter the worker runs under on the Mac.
+          python-version: "3.14"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      # The three checks run independently so one failure still shows the others.
+      # `!cancelled()` keeps them running after a failure but respects cancellation.
+      - name: pyflakes
+        run: python -m pyflakes worker.py */run.py tests/*.py
+
+      - name: pyright
+        if: ${{ !cancelled() }}
+        run: pyright
+
+      - name: pytest
+        if: ${{ !cancelled() }}
+        run: python -m pytest

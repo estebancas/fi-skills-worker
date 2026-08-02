@@ -1,0 +1,22 @@
+# Virtualenv — recreate with: python3 -m venv .venv && .venv/bin/pip install -r requirements-dev.txt
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Atomic writes that never got replaced
+*.tmp
+
+# macOS
+.DS_Store
+
+# Editor config is per-machine (interpreter paths are absolute)
+.vscode/
+
+# Never commit a filled-in LaunchAgent: the installed copy in
+# ~/Library/LaunchAgents/ carries the queue token in clear text.
+# com.hermes.worker.plist here is the token-free template and IS tracked.
+*.token
+.env

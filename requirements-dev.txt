@@ -1,0 +1,7 @@
+# Development and CI only. The skills themselves are stdlib-only and must stay
+# that way; the worker's single runtime dependency is pyyaml.
+pyyaml
+pytest
+pytest-timeout
+pyflakes
+pyright

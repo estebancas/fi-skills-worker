@@ -1,0 +1,10 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "extraPaths": ["tests"],
+  "exclude": [
+    ".venv",
+    "**/__pycache__",
+    "vps"
+  ]
+}
