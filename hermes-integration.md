@@ -65,9 +65,8 @@ is intended — do not try to work around it.
 
 Hermes has no queue tools at all today, which is why it correctly refused to act on the
 prompt above. It registers MCP servers through its own `config.yml`, so that is where this
-goes. [vps/queue_mcp.py](vps/queue_mcp.py) is the server — its home is the queue repo at
-`/home/dev/queue`, since it is a client of that service's HTTP API and the two change
-together. The copy here is just the staging copy.
+goes. The server is `queue_mcp.py`, which lives in the queue repo at `/home/dev/queue` —
+it is a client of that service's HTTP API, so the two version together.
 
 **1. Drop it in the repo and install the dependency.** Reuse the queue's existing venv so
 the repo has one environment and one requirements file:
@@ -172,12 +171,12 @@ republishes.
 ss -ltnp | grep 8080
 ```
 
-- `100.71.182.71:8080` — correct, tailnet only.
+- `<tailnet-ip>:8080` — correct, tailnet only.
 - `0.0.0.0:8080` or `*:8080` — **the queue is exposed to the internet**, protected only by
   the bearer token. Fix by binding to the Tailscale address:
 
   ```
-  uvicorn queue:app --host 100.71.182.71 --port 8080
+  uvicorn queue:app --host <tailnet-ip> --port 8080
   ```
 
   and deny it at the firewall as well: `sudo ufw deny 8080`.
@@ -203,7 +202,7 @@ Description=Hermes job queue
 After=network-online.target
 
 [Service]
-ExecStart=/path/to/venv/bin/uvicorn queue:app --host 100.71.182.71 --port 8080
+ExecStart=/path/to/venv/bin/uvicorn queue:app --host <tailnet-ip> --port 8080
 EnvironmentFile=/etc/hermes/queue.env     # chmod 600, holds QUEUE_TOKEN
 Restart=always
 RestartSec=5

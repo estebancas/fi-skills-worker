@@ -53,12 +53,12 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 
-        <!-- Queue service on ubuntu-8gb-hel1-2, over Tailscale. Confirmed
-             listening and enforcing auth (returns 401 without a token). -->
+        <!-- Queue service on the VPS, reached over Tailscale. Use the tailnet
+             address, not a public one: the queue must not be internet-facing. -->
         <key>QUEUE_URL</key>
-        <string>http://100.71.182.71:8080</string>
+        <string>http://REPLACE_ME:8080</string>
 
-        <!-- ==== the only thing left to fill in ====
+        <!-- ==== fill these in on the installed copy ====
              Edit the INSTALLED copy in ~/Library/LaunchAgents/, not this one.
              This file stays token-free so it is safe to commit and re-copy. -->
         <key>QUEUE_TOKEN</key>

@@ -123,12 +123,25 @@ launchctl bootout    gui/$UID/com.hermes.worker      # stop / before reinstall
 launchctl print      gui/$UID/com.hermes.worker      # state, exit codes, env
 ```
 
-Config is entirely environment, set in the plist: `QUEUE_URL`, `QUEUE_TOKEN`,
-`QUEUE_AUTH_HEADER`/`QUEUE_AUTH_SCHEME`, `WORKER_NAME`, `POLL_WAIT`, `JOB_TIMEOUT`,
-`HEARTBEAT_INTERVAL`, `PUBLISH_MANIFEST`, `NTFY_TOPIC`, plus everything the skills read.
+Config is entirely environment, set in the plist's `EnvironmentVariables` block:
+`QUEUE_URL`, `QUEUE_TOKEN`, `QUEUE_AUTH_HEADER`/`QUEUE_AUTH_SCHEME`, `WORKER_NAME`,
+`POLL_WAIT`, `JOB_TIMEOUT`, `HEARTBEAT_INTERVAL`, `PUBLISH_MANIFEST`, `NTFY_TOPIC`, plus
+everything the skills read. **The plist is the config file** — there is no dotenv loading,
+and no third-party dependency to add it.
 
-The queue token lives in the plist in clear text, so it stays `chmod 600` and out of
-version control.
+For running by hand, copy `.env.example` to `.env` (gitignored) and source it:
+
+```bash
+set -a; . ./.env; set +a
+.venv/bin/python3 worker.py --check
+```
+
+Nothing reads `.env` automatically. It duplicates the plist rather than feeding it, so a
+value changed in one does not reach the other.
+
+The committed plist is a template: `QUEUE_URL` and `QUEUE_TOKEN` are `REPLACE_ME`, and the
+real values go in the installed copy under `~/Library/LaunchAgents/`, which stays
+`chmod 600` and out of version control. Fill in the installed copy, never this one.
 
 If the queue's `/complete` payload shape ever differs from
 `{status, result, error, permanent}`, `complete()` in `worker.py` is the single place to

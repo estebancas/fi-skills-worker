@@ -10,7 +10,7 @@ no skill.yaml is rejected outright, so Hermes can never name a script that was
 not declared.
 
 Config (environment):
-    QUEUE_URL            base URL of the queue, e.g. http://100.71.182.71:8080
+    QUEUE_URL            base URL of the queue, e.g. http://<tailnet-ip>:8080
     QUEUE_TOKEN          bearer token
     QUEUE_AUTH_HEADER    header carrying it            (default: Authorization)
     QUEUE_AUTH_SCHEME    prefix for the value          (default: Bearer)
