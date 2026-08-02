@@ -106,9 +106,10 @@ def note_legacy(path: Path, summary: str):
 class StubQueue:
     """Minimal in-process queue. Records every call the worker makes."""
 
-    def __init__(self, jobs=None, manifest_status=404):
+    def __init__(self, jobs=None, manifest_status=404, catalog_status=200):
         self.jobs = list(jobs or [])
         self.manifest_status = manifest_status
+        self.catalog_status = catalog_status
         self.calls = []                          # (method, path, body)
         self.token_seen: str | None = None       # last Authorization header seen
         self._lock = threading.Lock()
@@ -144,6 +145,8 @@ class StubQueue:
                 outer.calls.append(("POST", path, body))
                 if path == "/manifest":
                     return self._reply(outer.manifest_status, {"ok": True})
+                if path == "/catalog":
+                    return self._reply(outer.catalog_status, {"ok": True})
                 self._reply(200, {"ok": True})
 
             def log_message(self, format, *args):
@@ -163,6 +166,9 @@ class StubQueue:
 
     def completions(self):
         return [b for m, p, b in self.calls if m == "POST" and p.endswith("/complete")]
+
+    def catalogs(self):
+        return [b for m, p, b in self.calls if m == "POST" and p == "/catalog"]
 
 
 @pytest.fixture

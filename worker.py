@@ -20,6 +20,9 @@ Config (environment):
     JOB_TIMEOUT          per-job ceiling, seconds      (default: 1800)
     HEARTBEAT_INTERVAL   seconds between heartbeats    (default: 30)
     PUBLISH_MANIFEST     push skills to the queue      (default: auto)
+    VAULT_DIR            notes to catalogue            (default: ~/vault)
+    PUBLISH_CATALOG      push the note catalog         (default: auto)
+    CATALOG_RECONCILE_S  seconds between full pushes   (default: 3600)
     NTFY_TOPIC           optional push notifications
 
 Usage:
@@ -29,8 +32,10 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -39,6 +44,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
@@ -55,8 +61,12 @@ POLL_WAIT = int(os.environ.get("POLL_WAIT", "30"))
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "1800"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
 PUBLISH_MANIFEST = os.environ.get("PUBLISH_MANIFEST", "auto").lower()
+VAULT = Path(os.environ.get("VAULT_DIR", Path.home() / "vault")).expanduser()
+PUBLISH_CATALOG = os.environ.get("PUBLISH_CATALOG", "auto").lower()
+CATALOG_RECONCILE_S = int(os.environ.get("CATALOG_RECONCILE_S", "3600"))
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
+OFF = ("0", "no", "false", "off")
 CAFFEINATE = "/usr/bin/caffeinate"
 BACKOFF_MAX = 60
 
@@ -205,6 +215,188 @@ def publish_manifest(skills: dict[str, dict]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# catalog
+#
+# The vault lives here; Hermes lives on the VPS and cannot read it. So the
+# worker replicates an index of it — frontmatter plus the LLM summary, never
+# the transcript body — and the queue makes that searchable. Discovery
+# questions ("do I have anything about X?") are then answerable while this
+# machine is asleep, which is the one thing the pull design handles badly.
+#
+# The note format is parsed here a third time (both skills also parse it).
+# The duplication is deliberate and bounded: this copy only ever *reads*, so
+# its worst failure is a missing catalog row, corrected by the next reconcile.
+# The skills' copies guard against clobbering a summary, which is not
+# recoverable — do not merge the two without moving all three to a shared
+# module.
+# ---------------------------------------------------------------------------
+
+SUM_BEGIN = "<!-- summary:begin -->"
+SUM_END = "<!-- summary:end -->"
+LEGACY_MARK = "\n## Summary\n"
+BLOCK_META = re.compile(
+    r"<!--\s*generated\s+(\S+)\s+by\s+(\S+)(?:\s+style=(\w+))?\s*-->"
+)
+
+_catalog_unsupported = False
+
+
+def split_front(text: str) -> tuple[dict | None, str]:
+    """Return (frontmatter, body). Frontmatter is None if this isn't a note."""
+    if not text.startswith("---"):
+        return None, text
+    end = text.find("\n---", 3)
+    if end == -1:
+        return None, text
+    try:
+        front = yaml.safe_load(text[3:end])
+    except yaml.YAMLError:
+        return None, text
+    if not isinstance(front, dict):
+        return None, text
+    return front, text[end + 4:].lstrip("\n")
+
+
+def strip_summary(body: str) -> tuple[str, str]:
+    """Return (transcript, summary block). Mirrors split_summary in the skills."""
+    i = body.find(SUM_BEGIN)
+    if i != -1:
+        j = body.find(SUM_END, i)
+        if j != -1:
+            j += len(SUM_END)
+            return (body[:i] + body[j:]).strip(), body[i:j]
+    i = body.find(LEGACY_MARK)
+    if i != -1:
+        return body[:i].strip(), body[i:]
+    return body.strip(), ""
+
+
+def parse_summary(block: str) -> tuple[str | None, str]:
+    """Return (style, summary text). Style is None on blocks written before
+    it was stamped, and on the pre-sentinel layout."""
+    if not block:
+        return None, ""
+    meta = BLOCK_META.search(block)
+    text = block[meta.end():] if meta else block
+    for marker in (SUM_BEGIN, SUM_END, "## Summary"):
+        text = text.replace(marker, "")
+    return (meta.group(3) if meta else None), text.strip()
+
+
+def _text(value) -> str | None:
+    """YAML gives dates back as date objects and numbers as ints."""
+    return None if value is None else str(value)
+
+
+def note_row(path: Path) -> dict | None:
+    """One catalog row, or None if this file is not a note we can index."""
+    try:
+        raw = path.read_bytes()
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        log(f"catalog: skipping {path.name}: {exc}")
+        return None
+
+    front, body = split_front(text)
+    if front is None:
+        return None
+
+    try:
+        rel = str(path.resolve().relative_to(VAULT.resolve()))
+    except (ValueError, OSError):
+        return None
+
+    transcript, block = strip_summary(body)
+    style, summary = parse_summary(block)
+    duration = front.get("duration_s")
+    return {
+        "path": rel,
+        "title": str(front.get("title") or path.stem),
+        "channel": _text(front.get("channel")),
+        "video_id": _text(front.get("video_id")),
+        "url": _text(front.get("url")),
+        "upload_date": _text(front.get("upload_date")),
+        "duration_s": duration if isinstance(duration, int) else None,
+        "transcript_method": _text(front.get("transcript_method")),
+        "chars": len(transcript),
+        "summary": summary,
+        "summary_style": style,
+        "has_summary": bool(summary),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "modified_at": datetime.fromtimestamp(
+            path.stat().st_mtime, timezone.utc
+        ).isoformat(timespec="seconds"),
+    }
+
+
+def scan_vault() -> list[dict]:
+    """Every indexable note under VAULT, in a stable order."""
+    if not VAULT.is_dir():
+        return []
+    rows = []
+    skipped = 0
+    for path in sorted(VAULT.rglob("*.md")):
+        row = note_row(path)
+        if row is None:
+            skipped += 1
+            continue
+        rows.append(row)
+    if skipped:
+        log(f"catalog: {skipped} file(s) had no usable frontmatter, not indexed")
+    return rows
+
+
+def publish_catalog(notes: list[dict], *, full: bool) -> None:
+    """Push notes to the queue. Optional — skipped if the endpoint is absent.
+
+    full=True means "this is the complete set": the queue drops rows it does
+    not see, which is how a note deleted in Obsidian leaves the index.
+    """
+    global _catalog_unsupported
+    if PUBLISH_CATALOG in OFF or _catalog_unsupported:
+        return
+    if not notes and not full:
+        return
+    try:
+        call("POST", "/catalog",
+             body={"worker": WORKER_NAME, "full": full, "notes": notes},
+             timeout=60)
+        log(f"published catalog ({len(notes)} note(s){', full' if full else ''})")
+    except QueueError as exc:
+        msg = str(exc)
+        if "HTTP 404" in msg or "HTTP 405" in msg:
+            _catalog_unsupported = True
+            log("queue has no /catalog endpoint — skipping "
+                "(set PUBLISH_CATALOG=0 to silence)")
+        else:
+            log(f"catalog publish failed, continuing: {msg}")
+
+
+def catalog_after(result) -> None:
+    """Push the single note a finished job touched.
+
+    Called after the job has already been reported, and swallows everything:
+    a catalog push must never turn a job that succeeded into one that failed.
+    """
+    if PUBLISH_CATALOG in OFF or not isinstance(result, dict):
+        return
+    rel = (result.get("transcript_path") or result.get("summary_path")
+           or result.get("source_path"))
+    if not isinstance(rel, str) or not rel:
+        return
+    try:
+        path = Path(rel)
+        path = (path if path.is_absolute() else VAULT / path).resolve()
+        if not path.is_relative_to(VAULT.resolve()):
+            return
+        row = note_row(path)
+        if row is not None:
+            publish_catalog([row], full=False)
+    except Exception as exc:
+        log(f"catalog: post-job push skipped: {exc!r}")
+
+
+# ---------------------------------------------------------------------------
 # execution
 # ---------------------------------------------------------------------------
 
@@ -306,6 +498,7 @@ def handle(job: dict, skills: dict[str, dict]) -> None:
             return
         log(f"job {job_id}: done in {took:.0f}s")
         complete(job_id, result=result)
+        catalog_after(result)
         return
 
     permanent = code == 2
@@ -324,8 +517,10 @@ def check(skills: dict[str, dict]) -> int:
     print(f"token      {'set' if QUEUE_TOKEN else '(unset)'} via {AUTH_HEADER}: {AUTH_SCHEME} ...")
     print(f"worker     {WORKER_NAME}")
     print(f"skills dir {SKILLS_DIR}")
+    print(f"vault      {VAULT}")
     print(f"python     {sys.executable}")
     print(f"timeouts   poll {POLL_WAIT}s, job {JOB_TIMEOUT}s, heartbeat {HEARTBEAT_INTERVAL}s")
+    print(f"catalog    {'off' if PUBLISH_CATALOG in OFF else f'on, full push every {CATALOG_RECONCILE_S}s'}")
     print(f"ntfy       {NTFY_TOPIC or '(unset)'}")
     print()
 
@@ -349,6 +544,16 @@ def check(skills: dict[str, dict]) -> int:
         print(f"  {job_type:<22} {'ok ' if ok else 'MISSING'} {script}")
         if not ok:
             problems.append(f"{job_type}: {script} does not exist")
+
+    if PUBLISH_CATALOG not in OFF:
+        print()
+        if not VAULT.is_dir():
+            notes.append(f"{VAULT} does not exist — the catalog will be empty")
+        rows = scan_vault()
+        print(f"  catalog: {len(rows)} note(s)")
+        for r in rows:
+            state = f"summary:{r['summary_style'] or 'unstamped'}" if r["has_summary"] else "no summary"
+            print(f"    {r['path']:<50} {r['chars']:>7} chars  {state}")
 
     print()
     for n in notes:
@@ -383,9 +588,17 @@ def main() -> int:
     log(f"worker {WORKER_NAME} starting — queue {QUEUE_URL}, "
         f"skills: {', '.join(sorted(skills))}")
     publish_manifest(skills)
+    publish_catalog(scan_vault(), full=True)
+    reconciled = time.time()
 
     backoff = 1
     while not stop.is_set():
+        # A note edited directly in Obsidian is reported by no job, so the
+        # catalog is re-sent whole on a timer. This bounds how stale it gets.
+        if CATALOG_RECONCILE_S > 0 and time.time() - reconciled >= CATALOG_RECONCILE_S:
+            publish_catalog(scan_vault(), full=True)
+            reconciled = time.time()
+
         try:
             job = lease_next()
             backoff = 1

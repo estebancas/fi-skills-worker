@@ -25,6 +25,9 @@ You → Hermes (VPC, always up) → enqueue_job() → SQLite queue (VPC)
                                         runs the skill, writes the vault
                                                       ↓
                                           POST /jobs/{id}/complete
+                                          POST /catalog   ← index of the vault,
+                                                            so Hermes can search
+                                                            it while the Mac sleeps
 ```
 
 Consequences that shape the code here:
@@ -125,9 +128,9 @@ launchctl print      gui/$UID/com.hermes.worker      # state, exit codes, env
 
 Config is entirely environment, set in the plist's `EnvironmentVariables` block:
 `QUEUE_URL`, `QUEUE_TOKEN`, `QUEUE_AUTH_HEADER`/`QUEUE_AUTH_SCHEME`, `WORKER_NAME`,
-`POLL_WAIT`, `JOB_TIMEOUT`, `HEARTBEAT_INTERVAL`, `PUBLISH_MANIFEST`, `NTFY_TOPIC`, plus
-everything the skills read. **The plist is the config file** — there is no dotenv loading,
-and no third-party dependency to add it.
+`POLL_WAIT`, `JOB_TIMEOUT`, `HEARTBEAT_INTERVAL`, `PUBLISH_MANIFEST`, `PUBLISH_CATALOG`,
+`CATALOG_RECONCILE_S`, `NTFY_TOPIC`, plus everything the skills read. **The plist is the
+config file** — there is no dotenv loading, and no third-party dependency to add it.
 
 For running by hand, copy `.env.example` to `.env` (gitignored) and source it:
 
@@ -146,6 +149,54 @@ real values go in the installed copy under `~/Library/LaunchAgents/`, which stay
 If the queue's `/complete` payload shape ever differs from
 `{status, result, error, permanent}`, `complete()` in `worker.py` is the single place to
 change.
+
+## The catalog
+
+The vault is here; Fi is on the VPS and cannot read it. Without something in between, Fi
+can create knowledge and never find it again — it has no tool that looks, only tools that
+enqueue more work.
+
+So the worker replicates an **index** of the vault to the queue, where SQLite FTS5 makes it
+searchable. What crosses the tunnel:
+
+```
+path, title, channel, video_id, url, upload_date, duration_s,
+transcript_method, chars, summary, summary_style, has_summary,
+sha256, modified_at
+```
+
+**The transcript body is not in that list, deliberately.** Fi can find the right note and
+report its summary; it cannot quote what was actually said. Quoting needs a `search_vault`
+skill running here — see *Not built yet*.
+
+Why this and not a synced folder on the VPS: an S3 (or SSHFS) mount is a filesystem
+transport, and a grep across it is one round-trip per file — the same mistake documented
+at the top of this file. It also makes freshness depend on Obsidian being open, which
+turns "the Mac is asleep" from a visibly queued job into a silently stale answer.
+
+Three triggers, all in `worker.py`:
+
+| When | Payload | Why |
+|---|---|---|
+| Startup, after the manifest push | full snapshot, `full: true` | reconciles anything missed while off |
+| After a job returning `transcript_path` / `summary_path` | that one note | new work is searchable immediately |
+| Every `CATALOG_RECONCILE_S` (3600) | full snapshot | a note edited in Obsidian is reported by no job |
+
+`full: true` also means "delete rows you don't see here", which is how a note deleted in
+Obsidian leaves the index. Deletions therefore propagate on a full push, not instantly.
+
+Failure is never fatal: a 404 disables catalog pushes for the process and logs once, and
+`catalog_after()` swallows everything — it runs *after* the job has been reported done, so
+nothing it does may turn a success into a failure.
+
+**`worker.py` parses the note format a third time** (both skills already do). That is
+deliberate, and the reason it is acceptable is that this copy only ever reads: its worst
+failure is a missing catalog row, fixed by the next reconcile. The skills' copies guard
+against clobbering a summary, which is not recoverable. Do not merge the two without
+moving all three onto a shared module.
+
+A note with `has_summary: false` has never been summarised, so only its title and channel
+are indexed. That is the strongest argument for chaining the two skills.
 
 ## Dependencies
 
@@ -261,7 +312,8 @@ What the suite is really protecting, in order of how much a regression would cos
 3. Exit 2 stays permanent and exit 1 stays transient — a poisoned job must not cycle
    forever, and a transient one must not dead-letter.
 4. An existing same-style summary is reused — ~30s of GPU per redundant job.
-5. A long job heartbeats — otherwise the lease lapses and the queue reissues it underneath
+5. The catalog never sends the transcript body, and a catalog failure never fails a job.
+6. A long job heartbeats — otherwise the lease lapses and the queue reissues it underneath
    the worker.
 
 For manual one-offs against the real vault, copy the note aside first and diff — the failure
@@ -276,3 +328,12 @@ mode to watch for is a clobbered summary, which is silent.
   cheap.
 - **Ollama has no LaunchAgent** — it starts with the app. A summarize job that lands while
   Ollama is down fails transient and retries, which recovers but is noisy.
+- **Transcript-body search.** A `search_vault` skill here, SQLite FTS5 over note bodies,
+  returning ranked snippets. Needed the first time Fi has to quote something the summary
+  left out. The catalog answers "which note", not "what exactly did it say".
+- **Embeddings.** Worth it once the catalog passes ~200 notes, or when recall gets
+  complaints: `nomic-embed-text` (274 MB) in Ollama, vectors beside the FTS5 rows, fused
+  by reciprocal rank. Not before — bm25 over titles and summaries is not the bottleneck at
+  this size.
+- **`notefmt.py`** — one implementation of the note format, imported by both skills and the
+  worker, retiring three divergent copies.
