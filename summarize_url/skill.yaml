@@ -1,0 +1,49 @@
+# ~/skills-worker/summarize_url/skill.yaml
+
+type: summarize_url
+
+summary: >
+  Fetch an article or blog post from a URL, summarise it with the local LLM,
+  and save it to the knowledge vault as a markdown note — the summary on top,
+  the extracted article text below. Use this for any web page the user pastes
+  that is not a video. A page already in the vault with a summary in the
+  requested style is returned as-is rather than re-fetched. X/Twitter is not
+  supported: only the article and blog case is handled.
+
+params:
+  type: object
+  required: [source]
+  properties:
+    source:
+      type: string
+      description: URL of the article or blog post
+    style:
+      type: string
+      enum: [brief, detailed, bullets]
+      default: detailed
+      description: brief = 3-5 sentences, detailed = 250-400 words, bullets = key takeaways
+    model:
+      type: string
+      description: Override the default Ollama model for this one job
+    force:
+      type: boolean
+      default: false
+      description: >
+        Re-summarise even when the note already carries a summary in this
+        style. Without it, an existing summary is returned unchanged.
+    refetch:
+      type: boolean
+      default: false
+      description: >
+        Download the page again instead of re-using the article text already
+        stored in the note. Only needed when the page itself has changed.
+
+produces:
+  [note_path, url, title, site, chars, summary, model, chunks, style,
+   regenerated, fetched]
+
+typical_duration_s: 60   # ~0 when an existing summary is reused
+
+idempotent: true
+
+run: ["/usr/bin/env", "python3", "run.py"]
