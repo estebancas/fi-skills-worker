@@ -159,18 +159,25 @@ python3 -m venv .venv && .venv/bin/pip install pyyaml
 
 ## Skills
 
-### `transcribe_video`
+What the worker can currently do. `skill.yaml` is the authoritative copy of each
+signature — the worker republishes it to the queue, and that is what Hermes plans
+against, so keep this table and the manifests in step.
 
-YouTube URL → note in `$VAULT/transcripts/`. Prefers published captions (manual over
-auto-generated); falls back to local whisper only when there are none. Refuses videos
-whose estimated whisper time exceeds `JOB_TIMEOUT * 0.8` unless `allow_long` is set —
-better to fail in 2 seconds than at the timeout after 30 wasted minutes.
+| Skill | Description | Params |
+|---|---|---|
+| `transcribe_video` | YouTube URL → note in `$VAULT/transcripts/`. Prefers published captions (manual over auto-generated) and falls back to local whisper only when there are none. Returns `transcript_path`, `method`, `title`, `channel`, `duration_s`, `video_id`, `chars`. | `source` *(required)* — video URL<br>`language` — ISO-639-1 or `auto` *(default `auto`)*<br>`force_whisper` — ignore published captions *(default `false`)*<br>`allow_long` — bypass the duration guard *(default `false`)* |
+| `summarize_transcript` | Vault note → summary, via local Ollama, written back above the transcript. Long transcripts are chunked and map-reduced. Returns `summary`, `summary_path`, `source_path`, `source_chars`, `model`, `chunks`, `style`, `regenerated`. | `path` *(required)* — vault-relative note path<br>`style` — `brief` \| `detailed` \| `bullets` *(default `detailed`)*<br>`model` — override `OLLAMA_MODEL` for one job<br>`write_back` — write into the note *(default `true`)*<br>`force` — redo an existing summary *(default `false`)* |
 
-### `summarize_transcript`
+### `transcribe_video` — notes
 
-Note → summary, via local Ollama. Long transcripts are chunked and map-reduced; at the
-current context size most fit in a single pass, which produces a noticeably better
-summary than merging partials.
+Refuses videos whose estimated whisper time exceeds `JOB_TIMEOUT * 0.8` unless
+`allow_long` is set — better to fail in 2 seconds than at the timeout after 30 wasted
+minutes. The estimate is `duration * WHISPER_COST + 60`.
+
+### `summarize_transcript` — notes
+
+At the current context size most transcripts fit in a single pass, which produces a
+noticeably better summary than merging partials.
 
 Re-running is a no-op when a summary in the requested style already exists — it returns
 the existing text with `regenerated: false` in ~50ms, without even probing Ollama. A
