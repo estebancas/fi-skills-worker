@@ -318,7 +318,8 @@ def handle(job: dict, skills: dict[str, dict]) -> None:
 # ---------------------------------------------------------------------------
 
 def check(skills: dict[str, dict]) -> int:
-    problems = []
+    problems = []   # block startup
+    notes = []      # worth saying, but fine
     print(f"queue      {QUEUE_URL or '(unset)'}")
     print(f"token      {'set' if QUEUE_TOKEN else '(unset)'} via {AUTH_HEADER}: {AUTH_SCHEME} ...")
     print(f"worker     {WORKER_NAME}")
@@ -332,10 +333,14 @@ def check(skills: dict[str, dict]) -> int:
         problems.append("QUEUE_URL is unset")
     if not QUEUE_TOKEN:
         problems.append("QUEUE_TOKEN is unset")
-    if not Path(CAFFEINATE).exists():
-        problems.append(f"{CAFFEINATE} missing — jobs will not hold sleep off")
     if not skills:
         problems.append(f"no skills found under {SKILLS_DIR}")
+
+    # Not a problem: run_skill only wraps in caffeinate when it exists, and a
+    # machine without it (any non-macOS host, CI) runs jobs perfectly well —
+    # it just won't hold off sleep. Worth saying, not worth refusing to start.
+    if not Path(CAFFEINATE).exists():
+        notes.append(f"{CAFFEINATE} not found — jobs will not hold off sleep")
 
     for job_type, skill in sorted(skills.items()):
         cmd = resolve_run(skill["run"])
@@ -346,6 +351,8 @@ def check(skills: dict[str, dict]) -> int:
             problems.append(f"{job_type}: {script} does not exist")
 
     print()
+    for n in notes:
+        print(f"NOTE: {n}")
     for p in problems:
         print(f"PROBLEM: {p}")
     print("check passed" if not problems else f"{len(problems)} problem(s)")

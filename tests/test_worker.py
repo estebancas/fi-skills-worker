@@ -355,6 +355,16 @@ def test_check_passes_with_valid_config(load, skills, capsys):
     assert "check passed" in capsys.readouterr().out
 
 
+def test_check_passes_without_caffeinate(load, skills, capsys, monkeypatch):
+    """Non-macOS hosts (and CI) have no caffeinate — that must not block startup."""
+    w = load_worker(load, skills, queue_url="http://127.0.0.1:8080")
+    monkeypatch.setattr(w, "CAFFEINATE", "/nonexistent/caffeinate")
+    assert w.check(w.load_skills(skills)) == 0
+    out = capsys.readouterr().out
+    assert "NOTE:" in out and "hold off sleep" in out
+    assert "PROBLEM:" not in out
+
+
 def test_check_flags_missing_config(load, skills, capsys):
     w = load_worker(load, skills, QUEUE_URL="", QUEUE_TOKEN="")
     assert w.check(w.load_skills(skills)) == 1
