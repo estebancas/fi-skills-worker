@@ -96,13 +96,12 @@
         <key>PUBLISH_MANIFEST</key>
         <string>auto</string>
 
-        <!-- Replicates an index of the vault (frontmatter + summary, never the
-             transcript) to the queue, so Fi can find a note while this Mac is
-             asleep. Set to 0 if the queue has no /catalog endpoint. -->
+        <!-- Pushes every note in the vault, IN FULL (transcript included), to
+             fi-hub, so Fi can search and quote it while this Mac is asleep. -->
         <key>PUBLISH_CATALOG</key>
         <string>auto</string>
-        <!-- Full re-push interval. Catches notes edited in Obsidian, which no
-             job reports, and propagates deletions. -->
+        <!-- Full re-push interval, then a reconcile. Catches notes edited in
+             Obsidian, which no job reports, and propagates deletions. -->
         <key>CATALOG_RECONCILE_S</key>
         <string>3600</string>
 
