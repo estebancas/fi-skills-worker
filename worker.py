@@ -43,6 +43,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import ssl
 import subprocess
@@ -60,6 +61,11 @@ import yaml
 from skilllib import notefmt
 
 HERE = Path(__file__).resolve().parent
+
+# Cloudflare's edge rejects the default `Python-urllib/x.y` User-Agent with a
+# 403 "Error 1010" before the request ever reaches fi-hub, so the token is not
+# even looked at. Every request names itself.
+USER_AGENT = "fi-skills-worker/1.0"
 
 QUEUE_URL = os.environ.get("QUEUE_URL", "").rstrip("/")
 QUEUE_TOKEN = os.environ.get("QUEUE_TOKEN", "")
@@ -153,8 +159,22 @@ class AuthError(QueueError):
     """HTTP 401. The queue is up and refused our token."""
 
 
+class EdgeBlocked(QueueError):
+    """HTTP 403 from Cloudflare's edge (error 1xxx), not from fi-hub.
+
+    fi-hub answers 401 for a bad token, never 403. A 403 with a Cloudflare error
+    body means a rule at the edge refused the client before fi-hub saw it:
+    usually the User-Agent. Not an outage, and a different fix from a bad token.
+    """
+
+
 class LeaseLost(QueueError):
     """HTTP 409. The job is no longer leased to us: it expired and was requeued."""
+
+
+# What Cloudflare's own error pages say: "error code: 1010" as plain text, or a
+# JSON problem document naming "error-1010" / "Error 1010: Access denied".
+EDGE_ERROR = re.compile(r"error code: 1\d{3}|cloudflare-1xxx-errors/error-1\d{3}|Error 1\d{3}:")
 
 
 def call(method: str, path: str, body=None, query=None, timeout=30, auth=True):
@@ -162,7 +182,7 @@ def call(method: str, path: str, body=None, query=None, timeout=30, auth=True):
     if query:
         url += "?" + urllib.parse.urlencode(query)
     data = json.dumps(body).encode() if body is not None else None
-    headers = {"Accept": "application/json"}
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     if data:
         headers["Content-Type"] = "application/json"
     if QUEUE_TOKEN and auth:
@@ -178,9 +198,16 @@ def call(method: str, path: str, body=None, query=None, timeout=30, auth=True):
             except json.JSONDecodeError:
                 raise QueueError(f"{method} {path} returned non-JSON: {raw[:200]!r}")
     except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")[:300]
-        err = {401: AuthError, 409: LeaseLost}.get(exc.code, QueueError)(
-            f"{method} {path} -> HTTP {exc.code}: {detail}")
+        full = exc.read().decode(errors="replace")
+        detail = full[:300]
+        edge = EDGE_ERROR.search(full) if exc.code == 403 else None
+        if edge:
+            err: QueueError = EdgeBlocked(
+                f"{method} {path} -> HTTP 403 blocked at the Cloudflare edge "
+                f"({edge.group(0)}); fi-hub never saw it. {detail[:120]}")
+        else:
+            err = {401: AuthError, 409: LeaseLost}.get(exc.code, QueueError)(
+                f"{method} {path} -> HTTP {exc.code}: {detail}")
         err.status = exc.code
         raise err from exc
     except urllib.error.URLError as exc:
@@ -914,6 +941,9 @@ def probe(skills: dict[str, dict]) -> int:
         failed |= not ok
     except TLSError as exc:
         fail(f"TLS: {exc}")
+    except EdgeBlocked as exc:
+        print("ok    TLS ok")
+        fail(f"blocked at the Cloudflare edge (User-Agent?): {exc}")
     except AuthError:
         print("ok    reachable, TLS ok")
         fail("auth: the queue answered 401 to our token (wrong or rotated QUEUE_TOKEN)")
@@ -925,6 +955,8 @@ def probe(skills: dict[str, dict]) -> int:
         print("NOTE  /healthz answered 200 without a token (expected 401)")
     except AuthError:
         print("ok    the queue refuses a request with no token (401)")
+    except EdgeBlocked as exc:
+        fail(f"blocked at the Cloudflare edge (User-Agent?) (no-token request): {exc}")
     except TLSError as exc:
         fail(f"TLS (no-token request): {exc}")
     except QueueError as exc:
@@ -1006,7 +1038,9 @@ def main() -> int:
             # The laptop is off the network often. That is normal, not an
             # error. But a refused token and a failed handshake are not
             # outages, and calling them one hides the real cause.
-            if isinstance(exc, AuthError):
+            if isinstance(exc, EdgeBlocked):
+                what = "blocked at the Cloudflare edge (User-Agent?), not an outage"
+            elif isinstance(exc, AuthError):
                 what = "queue refused the token (check QUEUE_TOKEN)"
             elif isinstance(exc, TLSError):
                 what = "TLS failure (not an outage)"

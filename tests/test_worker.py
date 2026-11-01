@@ -1639,3 +1639,92 @@ def test_a_failed_startup_push_is_retried_without_waiting_an_hour(
         run_main(w, monkeypatch, 3.5)
         assert len(q.reconciles()) == 1, "the retry landed and reconciled"
     assert len(attempts) == 2
+
+
+# ---------------------------------------------------------------------------
+# Cloudflare's edge (found live at the first reload)
+#
+# Python's default User-Agent, `Python-urllib/3.x`, gets "403 error code: 1010"
+# from Cloudflare before fi-hub is reached, so the token is never even looked
+# at. Nothing in the stub-only suite could see it, hence a stub that behaves
+# like the edge. Both the fix and the way it is reported are pinned.
+# ---------------------------------------------------------------------------
+
+def test_every_request_names_itself_not_python_urllib(load, skills, stub_queue):
+    with stub_queue(manifest_status=200) as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        w.call("GET", "/healthz")
+        w.call("GET", "/jobs/next")
+        w.call("POST", "/manifest", body={"worker": "mac", "skills": []})
+        w.call("GET", "/healthz", auth=False)
+        seen = list(q.user_agents)
+    assert len(seen) == 4
+    assert all(ua == "fi-skills-worker/1.0" for ua in seen), seen
+    assert not any(ua.startswith("Python-urllib") for ua in seen)
+
+
+def test_the_edge_that_blocks_the_default_agent_lets_the_worker_through(
+    load, skills, stub_queue
+):
+    """Fails if the User-Agent is ever dropped: the stub then behaves as the
+    live edge did and every call raises EdgeBlocked."""
+    for style in ("json", "text"):
+        with stub_queue(edge_block=style) as q:
+            w = load_worker(load, skills, queue_url=q.url)
+            status, body = w.call("GET", "/healthz")
+        assert status == 200 and body["ok"] is True
+
+
+def test_an_edge_403_is_its_own_error_whatever_the_body_style(load, skills, stub_queue):
+    for style in ("json", "text"):
+        with stub_queue(edge_block=style, edge_block_all=True) as q:
+            w = load_worker(load, skills, queue_url=q.url)
+            with pytest.raises(w.EdgeBlocked) as exc:
+                w.call("GET", "/jobs/next")
+        assert exc.value.status == 403
+        assert "Cloudflare edge" in str(exc.value)
+        assert not isinstance(exc.value, w.AuthError)
+
+
+def test_a_403_that_is_not_cloudflare_stays_a_plain_queue_error(
+    load, skills, stub_queue
+):
+    with stub_queue(notes_responder=lambda b: (403, {"error": "forbidden"})) as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        with pytest.raises(w.QueueError) as exc:
+            w.call("POST", "/notes", body={"notes": []})
+    assert not isinstance(exc.value, w.EdgeBlocked)
+    assert exc.value.status == 403
+
+
+def test_main_loop_reports_an_edge_block_as_one(
+    load, skills, stub_queue, monkeypatch, capsys
+):
+    with stub_queue(edge_block="json", edge_block_all=True) as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        run_main(w, monkeypatch, 1.5)
+    out = capsys.readouterr().out
+    assert "blocked at the Cloudflare edge (User-Agent?)" in out
+    assert "queue unavailable" not in out
+    assert "refused the token" not in out
+
+
+def test_probe_reports_an_edge_block_not_reachability(
+    load, skills, stub_queue, monkeypatch, capsys
+):
+    with stub_queue(edge_block="json", edge_block_all=True) as q:
+        w = load_worker(load, skills, queue_url=q.url, QUEUE_TOKEN="sekrit")
+        assert run_probe(w, skills, monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert out.count("blocked at the Cloudflare edge (User-Agent?)") == 2   # both calls
+    assert "reachability" not in out and "auth:" not in out
+    assert "sekrit" not in out
+
+
+def test_the_failed_pushes_name_the_edge_too(load, skills, vault, note, stub_queue, capsys):
+    with stub_queue(edge_block="text", edge_block_all=True) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+        assert q.reconciles() == []
+    assert "Cloudflare edge" in capsys.readouterr().out

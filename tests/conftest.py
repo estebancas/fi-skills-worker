@@ -126,7 +126,8 @@ class StubQueue:
     """
 
     def __init__(self, jobs=None, manifest_status=404, token=None, heartbeat_status=200, complete_status=200,
-                 notes_responder=None, reconcile_pending=None, reconcile_extra=None):
+                 notes_responder=None, reconcile_pending=None, reconcile_extra=None,
+                 edge_block=None, edge_block_all=False):
         self.jobs = list(jobs or [])
         self.manifest_status = manifest_status
         self.token = token
@@ -138,6 +139,14 @@ class StubQueue:
         self.reconcile_pending = list(reconcile_pending or [])
         # extra keys merged into every reconcile response (missing, stale, ...).
         self.reconcile_extra = dict(reconcile_extra or {})
+        # Simulates Cloudflare's edge, which answers 403 "error 1010" to the
+        # default `Python-urllib/x.y` User-Agent before fi-hub sees the request.
+        # edge_block is the body style, "json" (what urllib receives, captured
+        # live) or "text" (what curl receives); edge_block_all refuses every
+        # client, for tests of how the worker reports it.
+        self.edge_block = edge_block
+        self.edge_block_all = edge_block_all
+        self.user_agents: list[str] = []
         self.calls = []                          # (method, path, body-or-query)
         self.token_seen: str | None = None       # last Authorization header seen
         self._lock = threading.Lock()
@@ -156,6 +165,31 @@ class StubQueue:
                 if body:
                     self.wfile.write(body)
 
+            def _edge_blocked(self) -> bool:
+                ua = self.headers.get("User-Agent", "")
+                outer.user_agents.append(ua)
+                if not outer.edge_block:
+                    return False
+                if not (outer.edge_block_all or ua.startswith("Python-urllib")):
+                    return False
+                if outer.edge_block == "text":
+                    body = b"error code: 1010"
+                    ctype = "text/plain"
+                else:
+                    body = json.dumps({
+                        "type": "https://developers.cloudflare.com/support/troubleshooting/"
+                                "http-status-codes/cloudflare-1xxx-errors/error-1010/",
+                        "title": "Error 1010: Access denied", "status": 403,
+                        "detail": "The site owner has blocked access based on your "
+                                  "browser's signature."}).encode()
+                    ctype = "application/problem+json"
+                self.send_response(403)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return True
+
             def _authorised(self) -> bool:
                 outer.token_seen = self.headers.get("Authorization")
                 if outer.token is None:
@@ -168,7 +202,7 @@ class StubQueue:
             def do_GET(self):
                 u = urlparse(self.path)
                 outer.calls.append(("GET", u.path, parse_qs(u.query)))
-                if not self._authorised():
+                if self._edge_blocked() or not self._authorised():
                     return
                 if u.path == "/healthz":
                     return self._reply(200, {"ok": True, "time": 1793551872})
@@ -188,7 +222,7 @@ class StubQueue:
                 outer.calls.append(("POST", path, body))
                 outer.last_query = parse_qs(u.query)
                 outer.raw_sizes.append(len(raw))
-                if not self._authorised():
+                if self._edge_blocked() or not self._authorised():
                     return
                 if path == "/manifest":
                     if outer.manifest_status != 200:
