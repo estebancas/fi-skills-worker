@@ -58,10 +58,10 @@
         <key>SSL_CERT_FILE</key>
         <string>/etc/ssl/cert.pem</string>
 
-        <!-- Queue service on the VPS, reached over Tailscale. Use the tailnet
-             address, not a public one: the queue must not be internet-facing. -->
+        <!-- The fi-hub Cloudflare Worker. The base includes /worker. Outbound
+             HTTPS only: the Mac accepts no inbound connection. -->
         <key>QUEUE_URL</key>
-        <string>http://REPLACE_ME:8080</string>
+        <string>https://fi-hub.REPLACE_ME.workers.dev/worker</string>
 
         <!-- ==== fill these in on the installed copy ====
              Edit the INSTALLED copy in ~/Library/LaunchAgents/, not this one.
@@ -81,6 +81,10 @@
         <string>mac</string>
         <key>SKILLS_DIR</key>
         <string>/Users/oredrok/skills-worker</string>
+        <!-- Seconds to sleep after an empty poll. The queue answers at once
+             (a short poll), so this is what keeps the loop from spinning. -->
+        <key>POLL_INTERVAL</key>
+        <string>15</string>
         <key>POLL_WAIT</key>
         <string>30</string>
         <key>HEARTBEAT_INTERVAL</key>
@@ -136,10 +140,6 @@
         -->
         <key>COOKIES_FROM_BROWSER</key>
         <string>chrome</string>
-
-        <!-- Optional push notifications on permanent failures. -->
-        <key>NTFY_TOPIC</key>
-        <string></string>
     </dict>
 </dict>
 </plist>
