@@ -1,6 +1,7 @@
 # skills-worker
 
-Skills that a worker on this Mac runs on behalf of the **Hermes** agent.
+Skills that a worker on this Mac runs on behalf of **Fi**, the Claude project that talks to
+the **fi-hub** Cloudflare Worker.
 
 Each skill subdirectory is a `run.py` that does the work and a `skill.yaml` that declares
 it to the worker's manifest. [skilllib/](skilllib/) is not a skill — it is the code they
@@ -8,36 +9,41 @@ share.
 
 ## Why this exists
 
-Hermes runs on a VPC so it is always reachable. The VPC is slow and memory-constrained,
-and the knowledge vault plus the heavy tooling (yt-dlp, whisper, Ollama) live on this
-Mac, which is not always on.
+Fi runs in Claude (phone and desktop), so it is always reachable. The knowledge vault and the
+heavy tooling (yt-dlp, whisper, Ollama) live on this Mac, which is not always on.
 
-Mounting the Mac's filesystem into the VPC was tried first and abandoned: a filesystem
-transport moves bytes, not processes. The script still ran on the VPC's CPU and RAM, and
+Mounting the Mac's filesystem into a remote host was tried first and abandoned: a filesystem
+transport moves bytes, not processes. The script still ran on the remote CPU and RAM, and
 per-syscall round-trips over the tunnel made it slower than before.
 
-The working design inverts the direction — **the Mac pulls**:
+The working design inverts the direction — **the Mac pulls**. The queue is `fi-hub`, a
+Cloudflare Worker (queue and MCP server in one, with a SQLite Durable Object). It replaced
+a Hermes agent and a queue on a VPS, reached over Tailscale; that path is kept only as a
+rollback (tag `pre-fi-hub`).
 
 ```
-You → Hermes (VPC, always up) → enqueue_job() → SQLite queue (VPC)
-                                                      ↑ long-poll over Tailscale
-                                              Mac worker (launchd, KeepAlive)
-                                                      ↓
-                                        runs the skill, writes the vault
-                                                      ↓
-                                          POST /jobs/{id}/complete
-                                          POST /catalog   ← index of the vault,
-                                                            so Hermes can search
-                                                            it while the Mac sleeps
+You → Fi (Claude) ──MCP, OAuth──→ fi-hub (Cloudflare) ← enqueue_job, search_notes, get_note
+                                      ↑ HTTPS short-poll, bearer token, outbound only
+                              Mac worker (launchd, KeepAlive)
+                                      ↓
+                        runs the skill, writes the vault
+                                      ↓
+                          POST /jobs/{id}/complete
+                          POST /notes  ← the FULL text of each note, so Fi can search
+                                         and quote it while the Mac sleeps
 ```
 
 Consequences that shape the code here:
 
 - The Mac being offline is not a special case. It is a job that has not been leased yet.
 - Work happens on local disk. No NFS, no SSHFS, no UID mapping, no `server-filesystem`.
-- Only JSON crosses the tunnel. The Mac never accepts an inbound connection, and the VPC
-  holds no credentials into it.
-- Hermes gets typed job types from an allowlist, not a shell.
+- Only JSON crosses the wire. The Mac never accepts an inbound connection, and fi-hub holds
+  no credentials into it.
+- Fi gets typed job types from an allowlist (the manifests this worker publishes), not a
+  shell.
+- The queue is a *short* poll: it answers an empty queue at once. The worker sleeps between
+  polls (`POLL_INTERVAL`); without that it would spin and exhaust the Free plan's request
+  budget.
 
 ## Skill contract
 
@@ -111,22 +117,39 @@ transcript_method: captions:auto
 [worker.py](worker.py) is what pulls the queue. It runs under launchd via
 [com.hermes.worker.plist](com.hermes.worker.plist), installed to `~/Library/LaunchAgents/`.
 
-Loop: long-poll `GET /jobs/next` → run the skill → `POST /jobs/{id}/complete`, one job at
-a time, heartbeating every 30s while a job runs so a slow job is not requeued under it.
+Loop: `GET /jobs/next` (sleep `POLL_INTERVAL` on 204) → run the skill →
+`POST /jobs/{id}/complete`, one job at a time, heartbeating every 30s while a job runs so a
+slow job is not requeued under it. The default lease is 120s.
 
 - **The manifests are the allowlist.** A job type with no `skill.yaml` is rejected as a
-  permanent failure. Hermes cannot name a script that was not declared.
+  permanent failure. Fi cannot name a script that was not declared.
 - **`caffeinate -dims` wraps the job, not the worker** — this is a laptop. It stays awake
   exactly while a job runs.
 - **An unreachable queue is not an error.** Backoff 1s → 60s, because being off the
-  network is this machine's normal state.
+  network is this machine's normal state. A failed TLS handshake and a refused token
+  (HTTP 401) are *not* outages and are logged as what they are: calling them "queue
+  unavailable" hides a missing `SSL_CERT_FILE` or a rotated token behind a normal state.
+- **HTTPS needs `SSL_CERT_FILE=/etc/ssl/cert.pem`** (set in the plist). This Python has no
+  root certificates; see *Local environment*.
+- **A lost lease (HTTP 409) is logged with the job id and is not fatal.** The heartbeat
+  stops, `complete()` returns False, and the note the job wrote is still pushed: the job
+  will run again, which is safe, but the work on disk is real.
+- **The manifest is published until it lands**, and again with every hourly push. A launch
+  with no network would otherwise leave fi-hub refusing `enqueue_job` until the next
+  restart.
 - **Bare `python3` in a manifest's `run` is rewritten to the worker's own interpreter**
   (`.venv/bin/python3`), so a skill never depends on what PATH resolves to.
-- On SIGTERM it stops polling and exits; an in-flight job dies and its lease lapses, which
-  is what requeues it.
+- On SIGTERM/SIGINT it sets a stop flag: it stops polling, but a running job is not
+  interrupted — the worker exits when the job returns. launchd follows with SIGKILL after
+  its exit timeout, so a long job usually dies mid-run; its lease then lapses, and that is
+  what requeues it.
 
 ```bash
 .venv/bin/python3 worker.py --check    # validate config + skills, no network
+.venv/bin/python3 worker.py --probe    # GET /healthz over HTTPS, with and without the token,
+                                       # plus offline manifest validation. Reports TLS, auth
+                                       # and reachability separately; prints no token, and
+                                       # makes no call fi-hub counts as "the Mac was seen"
 .venv/bin/python3 worker.py --once     # handle a single job, then exit
 tail -f ~/Library/Logs/hermes-worker.log
 
@@ -137,8 +160,10 @@ launchctl print      gui/$UID/com.hermes.worker      # state, exit codes, env
 
 Config is entirely environment, set in the plist's `EnvironmentVariables` block:
 `QUEUE_URL`, `QUEUE_TOKEN`, `QUEUE_AUTH_HEADER`/`QUEUE_AUTH_SCHEME`, `WORKER_NAME`,
-`POLL_WAIT`, `JOB_TIMEOUT`, `HEARTBEAT_INTERVAL`, `PUBLISH_MANIFEST`, `PUBLISH_CATALOG`,
-`CATALOG_RECONCILE_S`, `NTFY_TOPIC`, plus everything the skills read. **The plist is the
+`POLL_INTERVAL`, `LEASE_SECONDS`, `POLL_WAIT` (sent as `wait`, which fi-hub ignores),
+`JOB_TIMEOUT`, `HEARTBEAT_INTERVAL`, `PUBLISH_MANIFEST`, `PUBLISH_CATALOG` (the notes push),
+`CATALOG_RECONCILE_S`, `SSL_CERT_FILE`, plus everything the skills read. There is no ntfy:
+pushes are server-side, and the worker sends none. **The plist is the
 config file** — there is no dotenv loading, and no third-party dependency to add it.
 
 For running by hand, copy `.env.example` to `.env` (gitignored) and source it:
@@ -193,58 +218,81 @@ from skilllib import llm, notefmt
 read through caption noise; the article prompt tells it to ignore navigation and cookie
 banners. Using the transcript prompt on clean prose makes the model hedge, and vice versa.
 
-## The catalog
+## The notes push
 
-The vault is here; Fi is on the VPS and cannot read it. Without something in between, Fi
+The vault is here; Fi runs in the cloud and cannot read it. Without something in between, Fi
 can create knowledge and never find it again — it has no tool that looks, only tools that
 enqueue more work.
 
-So the worker replicates an **index** of the vault to the queue, where SQLite FTS5 makes it
-searchable. What crosses the tunnel:
+So the worker pushes **every note, in full**, to fi-hub (`POST /notes`). fi-hub stores the
+text, indexes it (Cloudflare AI Search), and serves `search_notes`, `get_note` and
+`list_notes`. A note is searchable 70 to 90 seconds after it is pushed. What crosses the wire
+per note, built by `note_push_row`:
 
 ```
-path, title, channel, video_id, url, upload_date, duration_s,
-transcript_method, chars, summary, summary_style, has_summary,
-sha256, modified_at
+path, markdown, title, url, kind, date, sha256
 ```
 
-Articles carry `site`, `url_id`, `published`, and `fetch_method` where videos carry
-`channel`, `video_id`, `upload_date`, and `transcript_method`. `note_row` falls back
-between them, so both shapes land in one index and the VPS schema never learned there are
-two kinds of note.
+| Field | Value |
+|---|---|
+| `markdown` | the **full file text**, frontmatter and summary block included |
+| `sha256` | hex of the file **bytes**; the same hash again is a no-op on the hub |
+| `kind` | `video` if the note has `video_id` or `transcript_method`, else `article` |
+| `date` | **upload date for videos, fetch date for articles** (`fetched_at`), `""` if none |
+| `title`, `url` | from the frontmatter; the title falls back to the file name |
 
-**The transcript body is not in that list, deliberately.** Fi can find the right note and
-report its summary; it cannot quote what was actually said. Quoting needs a `search_vault`
-skill running here — see *Not built yet*.
+`kind` is read from the **raw frontmatter keys**. `note_row` folds an article's `url_id` into
+`video_id` and its `fetch_method` into `transcript_method` so one shape serves both; deriving
+`kind` from that folded row would call every article a video. The date is the fetch date, not
+the article's own publication date, because the notes already in the index were pushed that
+way and changing it would re-date them.
 
-Why this and not a synced folder on the VPS: an S3 (or SSHFS) mount is a filesystem
-transport, and a grep across it is one round-trip per file — the same mistake documented
-at the top of this file. It also makes freshness depend on Obsidian being open, which
-turns "the Mac is asleep" from a visibly queued job into a silently stale answer.
+**The transcript body leaving this machine is now the invariant.** It used to be the reverse
+(a summary-only index, on the grounds that quoting needed a search skill here); Fi now quotes
+from the body through `get_note`. The rule that replaces it is stricter about *what* is read:
+the path is resolved and confined to the vault **before** the file is opened, so a symlink in
+the vault pointing at `~/.ssh` is never read, because read now means published.
 
 Three triggers, all in `worker.py`:
 
 | When | Payload | Why |
 |---|---|---|
-| Startup, after the manifest push | full snapshot, `full: true` | reconciles anything missed while off |
-| After a job returning `transcript_path` / `summary_path` | that one note | new work is searchable immediately |
-| Every `CATALOG_RECONCILE_S` (3600) | full snapshot | a note edited in Obsidian is reported by no job |
+| Startup, after the manifest push | the whole vault, then reconcile | reconciles anything missed while off |
+| After a job returning `transcript_path` / `summary_path` / `note_path` | that one note | new work is searchable immediately |
+| Every `CATALOG_RECONCILE_S` (3600) | the whole vault, then reconcile; the manifest too | a note edited in Obsidian is reported by no job |
 
-`full: true` also means "delete rows you don't see here", which is how a note deleted in
-Obsidian leaves the index. Deletions therefore propagate on a full push, not instantly.
+A failed full push is retried after 5 minutes rather than an hour: a launch with no network
+would otherwise leave the hub without the vault that long.
 
-Failure is never fatal: a 404 disables catalog pushes for the process and logs once, and
-`catalog_after()` swallows everything — it runs *after* the job has been reported done, so
-nothing it does may turn a success into a failure.
+**Batching.** At most 200,000 bytes and 10 notes a request, packed in order. A note over the
+byte limit goes alone and is accepted (the hub's hard caps are 1,000,000 bytes and 40 notes);
+the worker reads `limits` from every response and uses them for the next batch. The request
+timeout is 90s. A note that gets HTTP 413 on its own is logged and skipped, never retried in
+a loop, and still counts as a note the vault holds. Other HTTP errors fail that batch and the
+rest go on; a transport error (unreachable, TLS, 401) ends the push.
+
+**Deletion is a separate call, never a flag on a batch.** After a full push in which *every
+batch landed*, the worker sends `POST /notes/reconcile` with `{path, sha256}` for every note
+(no text), and repeats until `pending_deletes` is 0 (the hub deletes 20 a call). That is how
+a note deleted in Obsidian leaves the index. A crash or failure mid-push therefore deletes
+nothing. An empty vault is never reconciled — the hub refuses it, because it looks like a
+vault that failed to mount. Whatever reconcile reports `missing` or `stale` is pushed once
+more in the same cycle; one pass, no second reconcile.
+
+Failure is never fatal: `notes_after()` swallows everything — it runs *after* the job has
+been reported done, so nothing it does may turn a success into a failure. Unlike the old
+catalog, a 404 does not switch pushes off for the process: here it means `QUEUE_URL` lost its
+`/worker`, and that should stay visible.
 
 **`worker.py` parses the note format a third time** (both skills already do). That is
 deliberate, and the reason it is acceptable is that this copy only ever reads: its worst
-failure is a missing catalog row, fixed by the next reconcile. The skills' copies guard
-against clobbering a summary, which is not recoverable. Do not merge the two without
-moving all three onto a shared module.
+failure is a missing or stale note on the hub, fixed by the next push. The skills' copies
+guard against clobbering a summary, which is not recoverable. Do not merge the two without
+moving all three onto a shared module. What has changed is the cost of a *read* going wrong:
+it publishes. That is why `load_note` confines the path first.
 
-A note with `has_summary: false` has never been summarised, so only its title and channel
-are indexed. That is the strongest argument for chaining the two skills.
+A note that has never been summarised is still pushed whole; Fi can quote its transcript but
+finds no summary at the top. That is the strongest argument for chaining the two skills.
 
 ## Dependencies
 
@@ -263,7 +311,7 @@ python3 -m venv .venv && .venv/bin/pip install pyyaml
 ## Skills
 
 What the worker can currently do. `skill.yaml` is the authoritative copy of each
-signature — the worker republishes it to the queue, and that is what Hermes plans
+signature — the worker republishes it to fi-hub, and that is what Fi plans
 against, so keep this table and the manifests in step.
 
 | Skill | Description | Params |
@@ -366,8 +414,9 @@ Facts about this machine that the code is tuned to. Re-check them before changin
 5. Reuse `skilllib` for the note format and the model — do not write a fourth copy. Add
    the two-line `sys.path` bootstrap at the top of `run.py`.
 6. Keep `skill.yaml`'s `params` and `produces` in step with `run.py` — the worker
-   republishes the manifest to Hermes, and that is what Hermes plans against. Stale
-   manifests mean Hermes cannot call a param that exists.
+   republishes the manifest to fi-hub, and that is what Fi plans against. fi-hub's
+   `enqueue_job` refuses any parameter a manifest does not declare, with its type and enum, so
+   a stale manifest makes a working param unusable. `worker.py --probe` validates them.
 7. Reload the worker so it picks up the new manifest:
    `launchctl bootout gui/$UID/com.hermes.worker && launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.hermes.worker.plist`
 
@@ -375,7 +424,7 @@ Facts about this machine that the code is tuned to. Re-check them before changin
 
 ```bash
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python3 -m pytest          # whole suite, 216 tests, ~20s
+.venv/bin/python3 -m pytest          # whole suite, 284 tests, ~1 min
 .venv/bin/python3 -m pytest -k skip  # one behaviour
 .venv/bin/pyright                    # type check — same engine as the editor
 .venv/bin/python3 -m pyflakes worker.py skilllib/*.py */run.py tests/*.py
@@ -398,7 +447,7 @@ real vault — so it is safe to run anywhere and suitable for CI:
 - **yt-dlp and whisper** are mocked at `run()` / `probe()` / `whisper_transcribe()`.
 - **curl** is mocked at `fetch()`. The extractor is exercised against fixture HTML, which
   is where the value is — that is the part with no library behind it.
-- **The queue** is a real stdlib `http.server` bound to port 0 in-process (`StubQueue` in
+- **The queue** (fi-hub's `/worker` API, shapes from its handoff) is a real stdlib `http.server` bound to port 0 in-process (`StubQueue` in
   `conftest.py`), so lease → run → complete is exercised over real HTTP.
 - **Skills the worker runs** are real subprocesses writing to `tmp_path`, so exit-code
   handling is genuinely tested rather than stubbed.
@@ -417,29 +466,28 @@ What the suite is really protecting, in order of how much a regression would cos
 3. Exit 2 stays permanent and exit 1 stays transient — a poisoned job must not cycle
    forever, and a transient one must not dead-letter.
 4. An existing same-style summary is reused — ~30s of GPU per redundant job.
-5. The catalog never sends the transcript body, and a catalog failure never fails a job.
+5. What is pushed is exactly the file — the full text and the hash of its bytes — and
+   nothing outside the vault is read to get it; a push failure never fails a job. (This
+   replaced "the catalog never sends the transcript body", which is intentionally reversed.)
 6. A long job heartbeats — otherwise the lease lapses and the queue reissues it underneath
    the worker.
+7. An empty poll sleeps, and a full push reconciles only after every batch landed — a spin
+   exhausts the Free plan, and an early reconcile deletes notes that were merely not sent yet.
 
 For manual one-offs against the real vault, copy the note aside first and diff — the failure
 mode to watch for is a clobbered summary, which is silent.
 
 ## Not built yet
 
-- **Chaining** `transcribe_video → summarize_transcript` as one Hermes job. If the worker
+- **Chaining** `transcribe_video → summarize_transcript` as one fi-hub job. If the worker
   enqueues the summarize step after transcribe completes, give the child its own
   idempotency key (`hash("summarize_transcript" + path)`) or a lapsed parent lease will
   enqueue a duplicate. Both steps are already idempotent, so re-delivering the pair is
   cheap.
 - **Ollama has no LaunchAgent** — it starts with the app. A summarize job that lands while
   Ollama is down fails transient and retries, which recovers but is noisy.
-- **Transcript-body search.** A `search_vault` skill here, SQLite FTS5 over note bodies,
-  returning ranked snippets. Needed the first time Fi has to quote something the summary
-  left out. The catalog answers "which note", not "what exactly did it say".
-- **Embeddings.** Worth it once the catalog passes ~200 notes, or when recall gets
-  complaints: `nomic-embed-text` (274 MB) in Ollama, vectors beside the FTS5 rows, fused
-  by reciprocal rank. Not before — bm25 over titles and summaries is not the bottleneck at
-  this size.
+- **Embeddings and search tuning** are fi-hub's, not this repo's: AI Search does hybrid
+  (semantic and keyword) search over the pushed text. Tuning it is a follow-up there.
 - **X/Twitter.** `summarize_url` rejects it. The free syndication endpoint gives one post
   with no replies; the thread needs the paid API or a logged-in session, and the
   Chrome-cookie path is already unreliable under launchd.
