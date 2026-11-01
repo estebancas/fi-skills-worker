@@ -6,12 +6,13 @@ Guarded behaviours:
   2. exit 2 -> permanent, exit 1 -> transient      (a poisoned job must not cycle)
   3. A long job heartbeats                         (or the lease lapses under it)
   4. An unreachable queue backs off, never crashes (this laptop is often offline)
-  5. The catalog never writes and never fails a job (it is a read-only replica)
+  5. The notes push never writes a note and never fails a job
 
 Every test runs against an in-process stub queue, and VAULT_DIR always points
 into tmp_path. Nothing reaches the VPS or the real vault.
 """
 
+import hashlib
 import socket
 import ssl
 import sys
@@ -23,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from conftest import (
+    FRONTMATTER,
     SKILL_NO_JSON,
     SKILL_OK,
     SKILL_PERMANENT,
@@ -46,7 +48,7 @@ def skills(tmp_path):
 
 def load_worker(load, skills_root, queue_url="http://127.0.0.1:1", **env):
     # VAULT_DIR points at a directory that does not exist unless a test opts
-    # in, and the catalog is off by default: no test may read the real vault.
+    # in, and the notes push is off by default: no test may read the real vault.
     return load(WORKER, {
         "SKILLS_DIR": str(skills_root),
         "VAULT_DIR": str(skills_root.parent / "no-vault"),
@@ -427,11 +429,11 @@ def test_main_refuses_to_start_with_no_skills(load, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# catalog — extraction
+# notes — extraction (note_row)
 #
 # This parser is the worker's own copy of the note format. It must agree with
-# the skills' copies on where a summary starts and ends, or the catalog
-# indexes markup instead of prose.
+# the skills' copies on where a summary starts and ends, or the index
+# carries markup instead of prose.
 # ---------------------------------------------------------------------------
 
 NOTE = "abc123-test-video.md"
@@ -439,7 +441,7 @@ NOTE = "abc123-test-video.md"
 
 @pytest.fixture
 def cat(load, skills, vault):
-    """A worker pointed at a real (temporary) vault, catalog enabled."""
+    """A worker pointed at a real (temporary) vault, pushing enabled."""
     return load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
 
 
@@ -466,7 +468,7 @@ def test_note_row_extracts_a_legacy_summary(cat, note):
     row = cat.note_row(note)
     assert row["summary"] == "Written before the sentinels existed."
     assert row["has_summary"] is True
-    # No style stamp to read, and the catalog must not invent one.
+    # No style stamp to read, and the extractor must not invent one.
     assert row["summary_style"] is None
 
 
@@ -515,7 +517,7 @@ def test_note_row_skips_undecodable_bytes(cat, vault):
     assert cat.note_row(binary) is None
 
 
-def test_scan_vault_indexes_notes_and_skips_the_rest(cat, note, vault):
+def test_scan_vault_lists_notes_and_skips_the_rest(cat, note, vault):
     (vault / "transcripts" / "stray.md").write_text("no frontmatter", encoding="utf-8")
     rows = cat.scan_vault()
     assert [r["path"] for r in rows] == [f"transcripts/{NOTE}"]
@@ -523,7 +525,7 @@ def test_scan_vault_indexes_notes_and_skips_the_rest(cat, note, vault):
 
 def test_scan_vault_is_stable_across_runs(cat, note):
     """The push is re-sent on a timer; an unchanged vault must produce an
-    identical payload, or the queue churns rows that did not change."""
+    identical payload, or the hub sees changes that are not there."""
     assert cat.scan_vault() == cat.scan_vault()
 
 
@@ -531,179 +533,6 @@ def test_scan_vault_on_a_missing_directory(load, skills, tmp_path):
     w = load_worker(load, skills, VAULT_DIR=str(tmp_path / "gone"),
                     PUBLISH_CATALOG="auto")
     assert w.scan_vault() == []
-
-
-# ---------------------------------------------------------------------------
-# catalog — publishing
-# ---------------------------------------------------------------------------
-
-def test_publish_catalog_sends_a_full_snapshot(load, skills, vault, note, stub_queue):
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.publish_catalog(w.scan_vault(), full=True)
-        sent = q.catalogs()
-    assert len(sent) == 1
-    assert sent[0]["full"] is True
-    assert sent[0]["worker"] == "mac"
-    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
-
-
-def test_publish_catalog_never_sends_the_transcript_body(
-    load, skills, vault, note, stub_queue
-):
-    """The body stays on this machine. Only metadata and the summary leave."""
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.publish_catalog(w.scan_vault(), full=True)
-        row = q.catalogs()[0]["notes"][0]
-    assert "so the thing about this is" not in repr(row)
-
-
-def test_publish_catalog_404_is_not_fatal_and_stops_retrying(
-    load, skills, vault, note, stub_queue
-):
-    with stub_queue(catalog_status=404) as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.publish_catalog(w.scan_vault(), full=True)
-        w.publish_catalog(w.scan_vault(), full=True)
-        assert len(q.catalogs()) == 1
-
-
-def test_publish_catalog_disabled_sends_nothing(load, skills, vault, note, stub_queue):
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="0")
-        w.publish_catalog(w.scan_vault(), full=True)
-        assert q.catalogs() == []
-
-
-def test_publish_catalog_survives_an_unreachable_queue(load, skills, vault, note):
-    w = load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-    w.publish_catalog(w.scan_vault(), full=True)   # must not raise
-
-
-# ---------------------------------------------------------------------------
-# catalog — the per-job push
-# ---------------------------------------------------------------------------
-
-def test_catalog_after_pushes_only_the_touched_note(
-    load, skills, vault, note, stub_queue
-):
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.catalog_after({"transcript_path": f"transcripts/{NOTE}"})
-        sent = q.catalogs()
-    assert len(sent) == 1
-    assert sent[0]["full"] is False
-    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
-
-
-def test_catalog_after_accepts_summary_path(load, skills, vault, note, stub_queue):
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.catalog_after({"summary_path": str(note), "regenerated": True})
-        assert len(q.catalogs()) == 1
-
-
-def test_catalog_after_refuses_a_path_outside_the_vault(
-    load, skills, vault, note, stub_queue, tmp_path
-):
-    outside = tmp_path / "secret.md"
-    outside.write_text(note.read_text(encoding="utf-8"), encoding="utf-8")
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.catalog_after({"transcript_path": "../secret.md"})
-        w.catalog_after({"transcript_path": str(outside)})
-        assert q.catalogs() == []
-
-
-def test_catalog_after_ignores_a_result_with_no_path(
-    load, skills, vault, stub_queue
-):
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.catalog_after({"ok": True})
-        w.catalog_after("not a dict")
-        w.catalog_after(None)
-        assert q.catalogs() == []
-
-
-def test_catalog_after_swallows_an_unexpected_error(
-    load, skills, vault, note, stub_queue
-):
-    """The job is already reported done by the time this runs."""
-    with stub_queue() as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.note_row = lambda _: (_ for _ in ()).throw(RuntimeError("boom"))
-        w.catalog_after({"transcript_path": f"transcripts/{NOTE}"})
-        assert q.catalogs() == []
-
-
-SKILL_WRITES_NOTE = """
-import json, sys
-p = json.load(sys.stdin)
-print(json.dumps({"transcript_path": p["path"], "ok": True}))
-"""
-
-
-def test_a_finished_job_updates_the_catalog(load, tmp_path, vault, note, stub_queue):
-    root = tmp_path / "skills"
-    make_skill(root, "writes_note", SKILL_WRITES_NOTE)
-    job = {"id": "j1", "type": "writes_note",
-           "params": {"path": f"transcripts/{NOTE}"}}
-    with stub_queue() as q:
-        w = load_worker(load, root, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.handle(job, w.load_skills(root))
-        completions, sent = q.completions(), q.catalogs()
-    assert completions[0]["status"] == "done"
-    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
-
-
-def test_a_broken_catalog_push_still_leaves_the_job_done(
-    load, tmp_path, vault, note, stub_queue
-):
-    root = tmp_path / "skills"
-    make_skill(root, "writes_note", SKILL_WRITES_NOTE)
-    job = {"id": "j1", "type": "writes_note",
-           "params": {"path": f"transcripts/{NOTE}"}}
-    with stub_queue(catalog_status=500) as q:
-        w = load_worker(load, root, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        w.handle(job, w.load_skills(root))
-        completions = q.completions()
-    assert len(completions) == 1
-    assert completions[0]["status"] == "done"
-    assert completions[0]["error"] is None
-
-
-def test_check_lists_the_catalog(load, skills, vault, note, capsys):
-    w = load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-    assert w.check(w.load_skills(skills)) == 0
-    out = capsys.readouterr().out
-    assert "catalog: 1 note(s)" in out
-    assert f"transcripts/{NOTE}" in out
-
-
-def test_startup_publishes_a_full_snapshot(load, skills, vault, note, stub_queue):
-    """Covers the wiring in main(), not just publish_catalog itself."""
-    job = {"id": "j1", "type": "good_skill", "params": {}}
-    with stub_queue(jobs=[job]) as q:
-        w = load_worker(load, skills, queue_url=q.url,
-                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
-        sys.argv = ["worker.py", "--once"]
-        assert w.main() == 0
-        sent = q.catalogs()
-    assert sent[0]["full"] is True
-    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
 
 
 # ---------------------------------------------------------------------------
@@ -925,7 +754,7 @@ def test_the_note_is_still_pushed_when_the_lease_was_lost(
     pushed = []
     with stub_queue(complete_status=409) as q:
         w = load_worker(load, skills, queue_url=q.url)
-        monkeypatch.setattr(w, "catalog_after", lambda result: pushed.append(result))
+        monkeypatch.setattr(w, "notes_after", lambda result: pushed.append(result))
         w.handle({"id": "j1", "type": "good_skill", "params": {}}, w.load_skills(skills))
     assert len(pushed) == 1
 
@@ -1072,3 +901,741 @@ def test_the_worker_no_longer_sends_pushes(load, tmp_path, stub_queue, monkeypat
 def test_ntfy_is_gone_from_the_worker_and_its_config():
     for rel in ("worker.py", "com.hermes.worker.plist", ".env.example"):
         assert "ntfy" not in (ROOT / rel).read_text(encoding="utf-8").lower(), rel
+
+
+# ---------------------------------------------------------------------------
+# notes — what is pushed
+#
+# fi-hub stores the FULL note and serves get_note and search_notes from it, so
+# the body leaving this machine is the point. The old catalog's invariant, "the
+# transcript body never leaves", is reversed on purpose; its test is rewritten
+# below as the inverse. What still must hold: the path is confined to the vault
+# before anything is read, kind follows the note's own keys, and what is sent
+# is exactly the file.
+# ---------------------------------------------------------------------------
+
+ARTICLE_FRONT = """---
+title: "An Article"
+site: "example.com"
+url: https://example.com/a
+url_id: 0123456789a
+published: 2025-03-04
+source_type: article
+fetch_method: curl+html
+chars: 900
+fetched_at: 2026-10-02T09:30:00+00:00
+---
+"""
+
+PLAIN_FRONT = """---
+title: "Neither"
+url: https://example.com/n
+---
+"""
+
+
+def write_note(vault, name, body="body text " * 50, front=FRONTMATTER):
+    path = vault / "transcripts" / name
+    path.write_text(front + "\n" + body, encoding="utf-8")
+    return path
+
+
+def test_push_row_has_exactly_the_seven_fields(cat, note):
+    row = cat.note_push_row(note)
+    assert set(row) == {"path", "markdown", "title", "url", "kind", "date", "sha256"}
+    assert row["path"] == f"transcripts/{NOTE}"
+    assert row["title"] == "Test Video"
+    assert row["url"] == "http://example/watch?v=abc123"
+
+
+def test_the_full_transcript_body_is_pushed(cat, note, stub_queue):
+    """Inverse of the old invariant. Fi quotes from the body, so the body is sent,
+    byte for byte, with its frontmatter and any summary block."""
+    note_with_summary(note, "A careful summary.", "detailed")
+    expected = note.read_text(encoding="utf-8")
+    row = cat.note_push_row(note)
+    assert row["markdown"] == expected
+    assert "so the thing about this is" in row["markdown"]
+    assert "A careful summary." in row["markdown"]
+    assert row["sha256"] == hashlib.sha256(note.read_bytes()).hexdigest()
+
+
+def test_the_body_reaches_the_queue_in_the_request(load, skills, vault, note, stub_queue):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=True)
+        sent = q.notes_pushes()[0]["notes"][0]
+    assert sent["markdown"] == note.read_text(encoding="utf-8")
+    assert "so the thing about this is" in sent["markdown"]
+
+
+def test_sha256_is_of_the_file_bytes_not_the_decoded_text(cat, vault):
+    # Non-ASCII and a stray CR: hashing re-encoded text would differ.
+    p = vault / "transcripts" / "crlf.md"
+    p.write_bytes(b'---\ntitle: "x"\nvideo_id: v\n---\n\ncaf\xc3\xa9 \xe2\x80\x94 \r\n')
+    row = cat.note_push_row(p)
+    assert row["sha256"] == hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def test_a_video_note_is_a_video_with_its_upload_date(cat, note):
+    row = cat.note_push_row(note)
+    assert row["kind"] == "video"
+    assert row["date"] == "2026-01-01"
+
+
+def test_an_article_is_an_article_dated_by_when_it_was_fetched(cat, vault):
+    p = write_note(vault, "art.md", front=ARTICLE_FRONT)
+    row = cat.note_push_row(p)
+    assert row["kind"] == "article"
+    assert row["date"] == "2026-10-02", "fetch date, not the 2025 publication date"
+
+
+def test_kind_comes_from_the_raw_keys_not_the_folded_row(cat, vault):
+    """note_row folds url_id into video_id and fetch_method into
+    transcript_method so one shape serves both. Deriving kind from that would
+    call every article a video."""
+    p = write_note(vault, "art.md", front=ARTICLE_FRONT)
+    folded = cat.note_row(p)
+    assert folded["video_id"] and folded["transcript_method"]     # the trap
+    assert cat.note_push_row(p)["kind"] == "article"
+
+
+def test_a_note_with_neither_key_is_an_article_with_no_date(cat, vault):
+    row = cat.note_push_row(write_note(vault, "n.md", front=PLAIN_FRONT))
+    assert row["kind"] == "article"
+    assert row["date"] == ""
+
+
+def test_title_falls_back_to_the_file_name(cat, vault):
+    p = write_note(vault, "untitled-thing.md", front="---\nvideo_id: v\n---\n")
+    assert cat.note_push_row(p)["title"] == "untitled-thing"
+
+
+def test_a_symlink_pointing_outside_the_vault_is_never_read(
+    load, skills, vault, note, tmp_path, monkeypatch
+):
+    """Without the check, a link to ~/.ssh/anything.md is read and published."""
+    secret = tmp_path / "outside" / "secret.md"
+    secret.parent.mkdir()
+    secret.write_text(FRONTMATTER + "\nTOP SECRET CONTENT", encoding="utf-8")
+    (vault / "transcripts" / "evil.md").symlink_to(secret)
+
+    w = load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+    opened = []
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes",
+                        lambda self: (opened.append(self.resolve()), real(self))[1])
+
+    pushed = w.scan_vault(w.note_push_row)
+    rows = w.scan_vault()
+    direct = w.note_push_row(vault / "transcripts" / "evil.md")
+
+    assert secret.resolve() not in opened, "the outside file was opened"
+    assert direct is None
+    assert [r["path"] for r in pushed] == [f"transcripts/{NOTE}"]
+    assert [r["path"] for r in rows] == [f"transcripts/{NOTE}"]
+    assert "TOP SECRET" not in repr(pushed)
+
+
+def test_a_symlink_into_the_vault_is_one_note_not_two(cat, vault, note):
+    (vault / "transcripts" / "alias.md").symlink_to(note)
+    assert [r["path"] for r in cat.scan_vault(cat.note_push_row)] == [f"transcripts/{NOTE}"]
+
+
+def test_note_row_also_checks_the_path_before_reading(
+    load, skills, vault, tmp_path, monkeypatch
+):
+    outside = tmp_path / "outside.md"
+    outside.write_text(FRONTMATTER, encoding="utf-8")
+    link = vault / "transcripts" / "link.md"
+    link.symlink_to(outside)
+    w = load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+    opened = []
+    real = Path.read_bytes
+    monkeypatch.setattr(Path, "read_bytes",
+                        lambda self: (opened.append(self.resolve()), real(self))[1])
+    assert w.note_row(link) is None
+    assert outside.resolve() not in opened
+
+
+# ---------------------------------------------------------------------------
+# notes — batching
+# ---------------------------------------------------------------------------
+
+def many_notes(vault, count, size=200):
+    for i in range(count):
+        write_note(vault, f"n{i:03d}.md", body="x" * size,
+                   front=FRONTMATTER.replace("abc123", f"id{i:03d}"))
+
+
+def test_at_most_ten_notes_per_request(load, skills, vault, stub_queue):
+    many_notes(vault, 25)
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        sizes = [len(b["notes"]) for b in q.notes_pushes()]
+    assert sizes == [10, 10, 5]
+
+
+def test_batches_keep_the_vault_order(load, skills, vault, stub_queue):
+    many_notes(vault, 12)
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        paths = [n["path"] for b in q.notes_pushes() for n in b["notes"]]
+    assert paths == sorted(paths) and len(paths) == 12
+
+
+def test_a_request_never_passes_200000_bytes(load, skills, vault, stub_queue):
+    many_notes(vault, 5, size=90_000)
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        sizes = [len(b["notes"]) for b in q.notes_pushes()]
+        raw = list(q.raw_sizes)
+    assert sizes == [2, 2, 1]
+    assert max(raw) <= 200_000
+
+
+def test_the_size_estimate_is_the_real_request_size(load, skills, vault, stub_queue):
+    many_notes(vault, 3, size=1000)
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        rows = w.scan_vault(w.note_push_row)
+        w.publish_notes(rows, full=False)
+        assert q.raw_sizes == [w._body_size(rows)]
+
+
+def test_a_note_over_the_limit_goes_alone_and_is_accepted(
+    load, skills, vault, stub_queue
+):
+    write_note(vault, "a-small.md", body="x" * 100,
+               front=FRONTMATTER.replace("abc123", "small1"))
+    write_note(vault, "b-huge.md", body="y" * 250_000,
+               front=FRONTMATTER.replace("abc123", "huge1"))
+    write_note(vault, "c-small.md", body="z" * 100,
+               front=FRONTMATTER.replace("abc123", "small2"))
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        shape = [[n["path"].rsplit("/", 1)[1] for n in b["notes"]] for b in q.notes_pushes()]
+    assert shape == [["a-small.md"], ["b-huge.md"], ["c-small.md"]]
+
+
+def test_the_servers_limits_are_adopted(load, skills, vault, stub_queue):
+    """limits in a response is the server telling us what to aim for."""
+    many_notes(vault, 25)
+    lim = {"recommended_batch_bytes": 200000, "recommended_batch_notes": 2,
+           "max_request_bytes": 1000000, "max_batch_notes": 40}
+
+    def responder(body):
+        return 200, {"ok": True, "inserted": len(body["notes"]), "limits": lim}
+
+    with stub_queue(notes_responder=responder) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        sizes = [len(b["notes"]) for b in q.notes_pushes()]
+    assert sizes == [10] + [2] * 7 + [1], "the first batch is sized before any response"
+
+
+def test_recommended_limits_never_exceed_the_servers_hard_caps(load, skills):
+    w = load_worker(load, skills)
+    w.apply_limits({"limits": {"recommended_batch_bytes": 5_000_000,
+                               "recommended_batch_notes": 500,
+                               "max_request_bytes": 1_000_000, "max_batch_notes": 40}})
+    assert w.LIMITS["bytes"] == 1_000_000 and w.LIMITS["notes"] == 40
+
+
+def test_garbage_limits_are_ignored(load, skills):
+    w = load_worker(load, skills)
+    before = dict(w.LIMITS)
+    w.apply_limits({"limits": {"recommended_batch_bytes": "lots",
+                               "recommended_batch_notes": -3, "max_batch_notes": True}})
+    w.apply_limits({"limits": "nope"})
+    w.apply_limits(None)
+    assert w.LIMITS == before
+
+
+def test_the_notes_request_timeout_is_at_least_60_seconds(
+    load, skills, vault, note, stub_queue
+):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        seen = {}
+        real = w.call
+
+        def spy(method, path, *a, **k):
+            seen[path] = k.get("timeout")
+            return real(method, path, *a, **k)
+
+        w.call = spy
+        w.publish_notes(w.scan_vault(w.note_push_row), full=True)
+    assert seen["/notes"] >= 60 and seen["/notes/reconcile"] >= 60
+
+
+def test_a_note_that_gets_413_alone_is_logged_skipped_and_not_retried(
+    load, skills, vault, stub_queue, capsys
+):
+    many_notes(vault, 3)
+
+    def responder(body):
+        if any(n["path"].endswith("n001.md") for n in body["notes"]):
+            return 413, {"error": "body over 1000000 bytes"}
+        return 200, {"ok": True, "inserted": len(body["notes"])}
+
+    with stub_queue(notes_responder=responder) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        rows = w.scan_vault(w.note_push_row)
+        assert w.publish_notes(rows, full=True), "a skip is not a failed push"
+        n001 = [1 for b in q.notes_pushes() for n in b["notes"] if n["path"].endswith("n001.md")]
+        kept = [k["path"] for k in q.reconciles()[0]["keep"]]
+    out = capsys.readouterr().out
+    assert "SKIPPING transcripts/n001.md" in out
+    assert len(n001) >= 1 and len(n001) <= 2, "tried alone at most once more, never looped"
+    assert len(kept) == 3, "still in the vault, so still kept"
+
+
+def test_a_413_on_a_batch_splits_it_down_to_the_one_note(
+    load, skills, vault, stub_queue
+):
+    many_notes(vault, 4)
+
+    def responder(body):
+        if len(body["notes"]) > 1:
+            return 413, {"error": "at most 1 notes per request"}
+        return 200, {"ok": True, "inserted": 1}
+
+    with stub_queue(notes_responder=responder) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        landed = {n["path"] for b in q.notes_pushes() if len(b["notes"]) == 1
+                  for n in b["notes"]}
+    assert len(landed) == 4
+
+
+def test_a_note_too_big_for_any_request_is_skipped_without_being_sent(
+    load, skills, vault, stub_queue
+):
+    write_note(vault, "enormous.md", body="q" * 1_100_000)
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        assert q.notes_pushes() == []
+
+
+def test_index_failures_in_the_response_are_logged(
+    load, skills, vault, note, stub_queue, capsys
+):
+    def responder(body):
+        return 200, {"ok": True, "inserted": 1, "index_failed": 1,
+                     "index_errors": [{"path": "transcripts/x.md", "error": "overloaded"}]}
+
+    with stub_queue(notes_responder=responder) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+    assert "not indexed yet" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# notes — reconcile
+# ---------------------------------------------------------------------------
+
+def test_a_full_push_is_followed_by_a_reconcile_of_paths_and_hashes_only(
+    load, skills, vault, note, stub_queue
+):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=True)
+        rec = q.reconciles()
+    assert len(rec) == 1
+    assert rec[0]["worker"] == "mac"
+    assert rec[0]["keep"] == [{"path": f"transcripts/{NOTE}",
+                               "sha256": hashlib.sha256(note.read_bytes()).hexdigest()}]
+    assert "markdown" not in repr(rec[0])
+
+
+def test_a_single_note_push_never_reconciles(load, skills, vault, note, stub_queue):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=False)
+        assert q.reconciles() == []
+
+
+def test_no_reconcile_after_a_batch_failed(load, skills, vault, stub_queue):
+    """A crash or error mid-push must delete nothing."""
+    many_notes(vault, 25)
+    calls = []
+
+    def responder(body):
+        calls.append(len(body["notes"]))
+        return (500, {"error": "boom"}) if len(calls) == 2 else (200, {"ok": True})
+
+    with stub_queue(notes_responder=responder) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+        assert q.reconciles() == []
+    assert len(calls) == 3, "an HTTP error on one batch does not stop the others"
+
+
+def test_an_unreachable_queue_stops_the_push_and_reconciles_nothing(
+    load, skills, vault
+):
+    many_notes(vault, 25)
+    w = load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+    attempts = []
+    real = w.call
+
+    def spy(method, path, *a, **k):
+        attempts.append(path)
+        return real(method, path, *a, **k)
+
+    w.call = spy
+    assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+    assert attempts == ["/notes"], "no point trying 2 more batches of a dead queue"
+
+
+def test_a_refused_token_stops_the_push(load, skills, vault, note, stub_queue):
+    with stub_queue(token="right") as q:
+        w = load_worker(load, skills, queue_url=q.url, QUEUE_TOKEN="wrong",
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+        assert [p for _, p, _ in q.calls] == ["/notes"]
+
+
+def test_a_stop_request_mid_push_reconciles_nothing(load, skills, vault, stub_queue):
+    many_notes(vault, 25)
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        real = w.call
+
+        def stopping(method, path, *a, **k):
+            out = real(method, path, *a, **k)
+            w.stop.set()
+            return out
+
+        w.call = stopping
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+        assert q.reconciles() == []
+
+
+def test_reconcile_repeats_until_nothing_is_pending(load, skills, vault, note, stub_queue):
+    with stub_queue(reconcile_pending=[40, 20, 0]) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=True)
+        assert len(q.reconciles()) == 3
+
+
+def test_reconcile_gives_up_when_it_makes_no_progress(
+    load, skills, vault, note, stub_queue, capsys
+):
+    with stub_queue(reconcile_pending=[7] * 50) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=True)
+        assert len(q.reconciles()) == 2
+    assert "no progress" in capsys.readouterr().out
+
+
+def test_an_empty_vault_is_never_reconciled(load, skills, vault, stub_queue):
+    """fi-hub refuses an empty keep: it looks like a vault that failed to mount."""
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is True
+        assert q.calls == []
+
+
+def test_missing_and_stale_notes_are_pushed_once_in_the_same_cycle(
+    load, skills, vault, stub_queue
+):
+    many_notes(vault, 3)
+    with stub_queue(reconcile_extra={"missing": ["transcripts/n001.md"],
+                                     "stale": ["transcripts/n002.md",
+                                               "transcripts/not-in-the-vault.md"]}) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=True)
+        pushes = [[n["path"] for n in b["notes"]] for b in q.notes_pushes()]
+        assert len(q.reconciles()) == 1, "one pass: no second reconcile"
+    assert pushes[0] == ["transcripts/n000.md", "transcripts/n001.md", "transcripts/n002.md"]
+    assert pushes[1:] == [["transcripts/n001.md", "transcripts/n002.md"]]
+
+
+def test_a_skipped_note_is_not_pushed_again_after_reconcile(
+    load, skills, vault, stub_queue
+):
+    many_notes(vault, 2)
+
+    def responder(body):
+        if any(n["path"].endswith("n001.md") for n in body["notes"]):
+            return 413, {"error": "too big"}
+        return 200, {"ok": True}
+
+    with stub_queue(notes_responder=responder,
+                    reconcile_extra={"missing": ["transcripts/n001.md"]}) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.publish_notes(w.scan_vault(w.note_push_row), full=True)
+        tries = [1 for b in q.notes_pushes() for n in b["notes"] if n["path"].endswith("n001.md")]
+    assert len(tries) <= 2
+
+
+# ---------------------------------------------------------------------------
+# notes — publishing, ported from the catalog tests
+# ---------------------------------------------------------------------------
+
+def test_publish_notes_sends_the_whole_vault(load, skills, vault, note, stub_queue):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is True
+        sent = q.notes_pushes()
+    assert len(sent) == 1
+    assert sent[0]["worker"] == "mac"
+    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
+
+
+def test_publish_notes_404_is_not_fatal_and_stays_visible(
+    load, skills, vault, note, stub_queue, capsys
+):
+    """A 404 here is a QUEUE_URL missing its /worker, which must keep showing in
+    the log. The old catalog went quiet after the first 404; the new endpoint
+    is not optional."""
+    with stub_queue(notes_responder=lambda b: (404, {"error": "not found"})) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+        assert len(q.notes_pushes()) == 2 and q.reconciles() == []
+    assert capsys.readouterr().out.count("push of 1 note(s) failed") == 2
+
+
+def test_publish_notes_disabled_sends_nothing(load, skills, vault, note, stub_queue):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="0")
+        assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is True
+        assert q.calls == []
+
+
+def test_publish_notes_survives_an_unreachable_queue(load, skills, vault, note):
+    w = load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+    assert w.publish_notes(w.scan_vault(w.note_push_row), full=True) is False
+
+
+# ---------------------------------------------------------------------------
+# notes — the per-job push
+# ---------------------------------------------------------------------------
+
+def test_notes_after_pushes_only_the_touched_note(load, skills, vault, note, stub_queue):
+    write_note(vault, "other.md")
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.notes_after({"transcript_path": f"transcripts/{NOTE}"})
+        sent = q.notes_pushes()
+        assert q.reconciles() == [], "one note is not the whole vault"
+    assert len(sent) == 1
+    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
+
+
+def test_notes_after_accepts_summary_path(load, skills, vault, note, stub_queue):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.notes_after({"summary_path": str(note), "regenerated": True})
+        assert len(q.notes_pushes()) == 1
+
+
+def test_notes_after_accepts_the_note_path_summarize_url_returns(
+    load, skills, vault, stub_queue
+):
+    """The old catalog_after never read note_path, so articles were only ever
+    indexed by the next full push."""
+    art = write_note(vault, "art.md", front=ARTICLE_FRONT)
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.notes_after({"note_path": str(art), "url": "https://example.com/a"})
+        pushed = q.notes_pushes()[0]["notes"][0]
+    assert pushed["kind"] == "article" and pushed["path"] == "transcripts/art.md"
+
+
+def test_notes_after_refuses_a_path_outside_the_vault(
+    load, skills, vault, note, stub_queue, tmp_path
+):
+    outside = tmp_path / "secret.md"
+    outside.write_text(note.read_text(encoding="utf-8"), encoding="utf-8")
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.notes_after({"transcript_path": "../secret.md"})
+        w.notes_after({"transcript_path": str(outside)})
+        assert q.notes_pushes() == []
+
+
+def test_notes_after_ignores_a_result_with_no_path(load, skills, vault, stub_queue):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.notes_after({"ok": True})
+        w.notes_after("not a dict")
+        w.notes_after(None)
+        assert q.notes_pushes() == []
+
+
+def test_notes_after_swallows_an_unexpected_error(load, skills, vault, note, stub_queue):
+    """The job is already reported done by the time this runs."""
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.note_push_row = lambda _: (_ for _ in ()).throw(RuntimeError("boom"))
+        w.notes_after({"transcript_path": f"transcripts/{NOTE}"})
+        assert q.notes_pushes() == []
+
+
+SKILL_WRITES_NOTE = """
+import json, sys
+p = json.load(sys.stdin)
+print(json.dumps({"transcript_path": p["path"], "ok": True}))
+"""
+
+
+def test_a_finished_job_pushes_its_note(load, tmp_path, vault, note, stub_queue):
+    root = tmp_path / "skills"
+    make_skill(root, "writes_note", SKILL_WRITES_NOTE)
+    job = {"id": "j1", "type": "writes_note",
+           "params": {"path": f"transcripts/{NOTE}"}}
+    with stub_queue() as q:
+        w = load_worker(load, root, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.handle(job, w.load_skills(root))
+        completions, sent = q.completions(), q.notes_pushes()
+    assert completions[0]["status"] == "done"
+    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
+
+
+def test_a_broken_notes_push_still_leaves_the_job_done(
+    load, tmp_path, vault, note, stub_queue
+):
+    root = tmp_path / "skills"
+    make_skill(root, "writes_note", SKILL_WRITES_NOTE)
+    job = {"id": "j1", "type": "writes_note",
+           "params": {"path": f"transcripts/{NOTE}"}}
+    with stub_queue(notes_responder=lambda b: (500, {"error": "boom"})) as q:
+        w = load_worker(load, root, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.handle(job, w.load_skills(root))
+        completions = q.completions()
+    assert len(completions) == 1
+    assert completions[0]["status"] == "done"
+    assert completions[0]["error"] is None
+
+
+def test_the_note_is_pushed_even_when_the_lease_was_lost(
+    load, tmp_path, vault, note, stub_queue
+):
+    """The skill wrote the note whether or not the queue recorded the result."""
+    root = tmp_path / "skills"
+    make_skill(root, "writes_note", SKILL_WRITES_NOTE)
+    job = {"id": "j1", "type": "writes_note",
+           "params": {"path": f"transcripts/{NOTE}"}}
+    with stub_queue(complete_status=409) as q:
+        w = load_worker(load, root, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        w.handle(job, w.load_skills(root))
+        sent = q.notes_pushes()
+    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
+
+
+def test_check_lists_the_notes(load, skills, vault, note, capsys):
+    w = load_worker(load, skills, VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+    assert w.check(w.load_skills(skills)) == 0
+    out = capsys.readouterr().out
+    assert "notes: 1 note(s)" in out
+    assert f"transcripts/{NOTE}" in out
+
+
+# ---------------------------------------------------------------------------
+# notes and manifest — the wiring in main()
+# ---------------------------------------------------------------------------
+
+def test_startup_pushes_the_vault_and_reconciles(load, skills, vault, note, stub_queue):
+    """Covers main(), not just publish_notes itself."""
+    job = {"id": "j1", "type": "good_skill", "params": {}}
+    with stub_queue(jobs=[job]) as q:
+        w = load_worker(load, skills, queue_url=q.url,
+                        VAULT_DIR=str(vault), PUBLISH_CATALOG="auto")
+        sys.argv = ["worker.py", "--once"]
+        assert w.main() == 0
+        sent, rec = q.notes_pushes(), q.reconciles()
+    assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
+    assert len(rec) == 1
+
+
+def test_the_hourly_timer_republishes_the_manifest_and_the_vault(
+    load, skills, vault, note, stub_queue, monkeypatch
+):
+    with stub_queue(manifest_status=200) as q:
+        w = load_worker(load, skills, queue_url=q.url, VAULT_DIR=str(vault),
+                        PUBLISH_CATALOG="auto", PUBLISH_MANIFEST="auto",
+                        CATALOG_RECONCILE_S="1")
+        run_main(w, monkeypatch, 3.5)
+        manifests = [1 for m, p, _ in q.calls if p == "/manifest"]
+        fulls = len(q.reconciles())
+    assert len(manifests) >= 3 and fulls >= 3
+
+
+def test_a_manifest_that_failed_at_launch_is_retried_until_it_lands(
+    load, skills, vault, stub_queue, monkeypatch, capsys
+):
+    """Launched with no network: the first publish fails, and enqueue_job refuses
+    until a manifest lands. Waiting for the next restart would be days."""
+    with stub_queue(manifest_status=503) as q:
+        w = load_worker(load, skills, queue_url=q.url, PUBLISH_CATALOG="0",
+                        PUBLISH_MANIFEST="auto", CATALOG_RECONCILE_S="0")
+        w.MANIFEST_RETRY_S = 1
+        threading.Timer(1.6, lambda: setattr(q, "manifest_status", 200)).start()
+        run_main(w, monkeypatch, 5.0)
+        posts = [1 for m, p, _ in q.calls if p == "/manifest"]
+    out = capsys.readouterr().out
+    assert "will retry" in out
+    assert "published manifest" in out
+    after = out.split("published manifest")[1:]
+    assert len(posts) >= 3
+    assert len(after) == 1, "once it landed, no more retries"
+
+
+def test_a_failed_startup_push_is_retried_without_waiting_an_hour(
+    load, skills, vault, note, stub_queue, monkeypatch
+):
+    attempts = []
+
+    def responder(body):
+        attempts.append(1)
+        return (503, {"error": "starting"}) if len(attempts) == 1 else (200, {"ok": True})
+
+    with stub_queue(notes_responder=responder) as q:
+        w = load_worker(load, skills, queue_url=q.url, VAULT_DIR=str(vault),
+                        PUBLISH_CATALOG="auto", CATALOG_RECONCILE_S="3600")
+        w.NOTES_RETRY_S = 1
+        run_main(w, monkeypatch, 3.5)
+        assert len(q.reconciles()) == 1, "the retry landed and reconciled"
+    assert len(attempts) == 2

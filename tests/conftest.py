@@ -122,16 +122,13 @@ class StubQueue:
 
     Pass `token` to make it enforce the bearer like the real one (401 with
     {"error": "bad or missing token"}); left None it accepts anything, which is
-    what the older tests assume. The /catalog route is the retired VPS queue's
-    and survives only until its tests are ported to /notes.
+    what the older tests assume.
     """
 
-    def __init__(self, jobs=None, manifest_status=404, catalog_status=200,
-                 token=None, heartbeat_status=200, complete_status=200,
-                 notes_responder=None, reconcile_pending=None):
+    def __init__(self, jobs=None, manifest_status=404, token=None, heartbeat_status=200, complete_status=200,
+                 notes_responder=None, reconcile_pending=None, reconcile_extra=None):
         self.jobs = list(jobs or [])
         self.manifest_status = manifest_status
-        self.catalog_status = catalog_status
         self.token = token
         self.heartbeat_status = heartbeat_status
         self.complete_status = complete_status
@@ -139,6 +136,8 @@ class StubQueue:
         self.notes_responder = notes_responder
         # pending_deletes to report on successive /notes/reconcile calls.
         self.reconcile_pending = list(reconcile_pending or [])
+        # extra keys merged into every reconcile response (missing, stale, ...).
+        self.reconcile_extra = dict(reconcile_extra or {})
         self.calls = []                          # (method, path, body-or-query)
         self.token_seen: str | None = None       # last Authorization header seen
         self._lock = threading.Lock()
@@ -196,8 +195,6 @@ class StubQueue:
                         return self._reply(outer.manifest_status, {"ok": True})
                     return self._reply(200, {"hash": "sha256:stub",
                                              "skills": len(body.get("skills", []))})
-                if path == "/catalog":
-                    return self._reply(outer.catalog_status, {"ok": True})
                 if path == "/notes":
                     if outer.notes_responder:
                         code, obj = outer.notes_responder(body)
@@ -215,7 +212,7 @@ class StubQueue:
                         "ok": True, "kept": len(body.get("keep", [])), "deleted": 0,
                         "delete_failed": 0, "delete_errors": [],
                         "pending_deletes": pending, "missing": [], "missing_count": 0,
-                        "stale": [], "stale_count": 0})
+                        "stale": [], "stale_count": 0, **outer.reconcile_extra})
                 if path.endswith("/heartbeat"):
                     if outer.heartbeat_status != 200:
                         return self._reply(outer.heartbeat_status, {
@@ -248,9 +245,6 @@ class StubQueue:
 
     def completions(self):
         return [b for m, p, b in self.calls if m == "POST" and p.endswith("/complete")]
-
-    def catalogs(self):
-        return [b for m, p, b in self.calls if m == "POST" and p == "/catalog"]
 
     def notes_pushes(self):
         return [b for m, p, b in self.calls if m == "POST" and p == "/notes"]
