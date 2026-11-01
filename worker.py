@@ -2,32 +2,40 @@
 """
 ~/skills-worker/worker.py
 
-Long-polls the Hermes job queue on the VPC, runs the matching skill locally,
-and reports the result back. Runs under launchd; see com.hermes.worker.plist.
+Polls the fi-hub job queue (a Cloudflare Worker), runs the matching skill
+locally, and reports the result back. Runs under launchd; see
+com.hermes.worker.plist.
 
 The skill manifests in this directory are the allowlist: a job whose type has
 no skill.yaml is rejected outright, so Hermes can never name a script that was
 not declared.
 
 Config (environment):
-    QUEUE_URL            base URL of the queue, e.g. http://<tailnet-ip>:8080
+    QUEUE_URL            base URL of the queue, https://fi-hub.<account>.workers.dev/worker
     QUEUE_TOKEN          bearer token
     QUEUE_AUTH_HEADER    header carrying it            (default: Authorization)
     QUEUE_AUTH_SCHEME    prefix for the value          (default: Bearer)
     WORKER_NAME          identifies this worker        (default: mac)
     SKILLS_DIR           where the skills live         (default: this directory)
-    POLL_WAIT            long-poll seconds             (default: 30)
+    POLL_INTERVAL        sleep after an empty poll     (default: 15)
+    LEASE_SECONDS        lease asked for per poll      (default: 120)
+    POLL_WAIT            sent as `wait`, which the queue ignores (default: 30)
     JOB_TIMEOUT          per-job ceiling, seconds      (default: 1800)
     HEARTBEAT_INTERVAL   seconds between heartbeats    (default: 30)
     PUBLISH_MANIFEST     push skills to the queue      (default: auto)
     VAULT_DIR            notes to catalogue            (default: ~/vault)
     PUBLISH_CATALOG      push the note catalog         (default: auto)
     CATALOG_RECONCILE_S  seconds between full pushes   (default: 3600)
-    NTFY_TOPIC           optional push notifications
+
+Python's venv has no root certificates on this Mac, so HTTPS needs
+SSL_CERT_FILE (the plist sets it to /etc/ssl/cert.pem).
 
 Usage:
     worker.py            run the loop
     worker.py --check    validate config and skills, touch no network
+    worker.py --probe    GET /healthz with and without the token, and validate
+                         the local manifests. Never makes a call the queue
+                         counts as "the Mac was seen".
     worker.py --once     handle a single job, then exit
 """
 
@@ -36,6 +44,7 @@ import hashlib
 import json
 import os
 import signal
+import ssl
 import subprocess
 import sys
 import threading
@@ -59,13 +68,16 @@ AUTH_SCHEME = os.environ.get("QUEUE_AUTH_SCHEME", "Bearer")
 WORKER_NAME = os.environ.get("WORKER_NAME", "mac")
 SKILLS_DIR = Path(os.environ.get("SKILLS_DIR", HERE)).expanduser()
 POLL_WAIT = int(os.environ.get("POLL_WAIT", "30"))
+# The queue is a short poll: it answers an empty queue at once. Without a sleep
+# on 204 this loop would spin and burn the Free plan's daily request budget.
+POLL_INTERVAL = max(1.0, float(os.environ.get("POLL_INTERVAL", "15")))
+LEASE_SECONDS = int(os.environ.get("LEASE_SECONDS", "120"))
 JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT", "1800"))
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
 PUBLISH_MANIFEST = os.environ.get("PUBLISH_MANIFEST", "auto").lower()
 VAULT = Path(os.environ.get("VAULT_DIR", Path.home() / "vault")).expanduser()
 PUBLISH_CATALOG = os.environ.get("PUBLISH_CATALOG", "auto").lower()
 CATALOG_RECONCILE_S = int(os.environ.get("CATALOG_RECONCILE_S", "3600"))
-NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "")
 
 OFF = ("0", "no", "false", "off")
 CAFFEINATE = "/usr/bin/caffeinate"
@@ -76,21 +88,6 @@ stop = threading.Event()
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}", flush=True)
-
-
-def alert(title: str, body: str) -> None:
-    """Best-effort push. A failed notification must never fail a job."""
-    if not NTFY_TOPIC:
-        return
-    try:
-        req = urllib.request.Request(
-            f"https://ntfy.sh/{NTFY_TOPIC}",
-            data=body.encode(),
-            headers={"Title": title, "Priority": "default"},
-        )
-        urllib.request.urlopen(req, timeout=10)
-    except Exception as exc:
-        log(f"(ntfy failed: {exc})")
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +140,19 @@ class QueueError(Exception):
     """Queue unreachable or misbehaving. Always transient — back off and retry."""
 
 
-def call(method: str, path: str, body=None, query=None, timeout=30):
+class TLSError(QueueError):
+    """The TLS handshake failed. Not an outage: usually missing root certificates."""
+
+
+class AuthError(QueueError):
+    """HTTP 401. The queue is up and refused our token."""
+
+
+class LeaseLost(QueueError):
+    """HTTP 409. The job is no longer leased to us: it expired and was requeued."""
+
+
+def call(method: str, path: str, body=None, query=None, timeout=30, auth=True):
     url = QUEUE_URL + path
     if query:
         url += "?" + urllib.parse.urlencode(query)
@@ -151,7 +160,7 @@ def call(method: str, path: str, body=None, query=None, timeout=30):
     headers = {"Accept": "application/json"}
     if data:
         headers["Content-Type"] = "application/json"
-    if QUEUE_TOKEN:
+    if QUEUE_TOKEN and auth:
         headers[AUTH_HEADER] = f"{AUTH_SCHEME} {QUEUE_TOKEN}".strip()
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
@@ -165,16 +174,33 @@ def call(method: str, path: str, body=None, query=None, timeout=30):
                 raise QueueError(f"{method} {path} returned non-JSON: {raw[:200]!r}")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
-        raise QueueError(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        err = {401: AuthError, 409: LeaseLost}.get(exc.code, QueueError)
+        raise err(f"{method} {path} -> HTTP {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        # urlopen wraps a failed handshake in URLError, so look at the reason.
+        if isinstance(exc.reason, ssl.SSLError):
+            raise TLSError(_tls_message(method, path, exc.reason)) from exc
+        raise QueueError(f"{method} {path} unreachable: {exc}") from exc
+    except ssl.SSLError as exc:          # before OSError: SSLError is one
+        raise TLSError(_tls_message(method, path, exc)) from exc
+    except (TimeoutError, OSError) as exc:
         raise QueueError(f"{method} {path} unreachable: {exc}") from exc
 
 
+def _tls_message(method: str, path: str, exc: BaseException) -> str:
+    return (f"{method} {path} TLS failure: {exc} "
+            f"(SSL_CERT_FILE={os.environ.get('SSL_CERT_FILE') or 'unset'})")
+
+
 def lease_next():
-    """Long-poll for a job. Returns the job dict, or None if none was offered."""
+    """Ask for a job. A short poll: an empty queue is answered at once with 204.
+
+    `wait` is still sent, harmlessly: the queue ignores it. The caller sleeps
+    POLL_INTERVAL when this returns None.
+    """
     _, body = call(
         "GET", "/jobs/next",
-        query={"worker": WORKER_NAME, "wait": POLL_WAIT},
+        query={"worker": WORKER_NAME, "wait": POLL_WAIT, "lease": LEASE_SECONDS},
         timeout=POLL_WAIT + 15,
     )
     if not body:
@@ -186,17 +212,29 @@ def lease_next():
 
 
 def heartbeat(job_id: str) -> None:
-    call("POST", f"/jobs/{job_id}/heartbeat", body={"worker": WORKER_NAME}, timeout=15)
+    """Extend the lease. The worker name goes in the JSON body."""
+    call("POST", f"/jobs/{job_id}/heartbeat", body={"worker": WORKER_NAME},
+         query={"lease": LEASE_SECONDS}, timeout=15)
 
 
-def complete(job_id: str, *, result=None, error=None, permanent=False) -> None:
-    call("POST", f"/jobs/{job_id}/complete", body={
-        "worker": WORKER_NAME,
-        "status": "done" if error is None else "failed",
-        "result": result,
-        "error": error,
-        "permanent": permanent,
-    }, timeout=30)
+def complete(job_id: str, *, result=None, error=None, permanent=False) -> bool:
+    """Report a job. False means the queue did not record it (409: lease lost).
+
+    A lost lease is not fatal: the job was requeued and will run again, which
+    is safe because every skill is. The work this attempt did is still on disk.
+    """
+    try:
+        call("POST", f"/jobs/{job_id}/complete", body={
+            "worker": WORKER_NAME,
+            "status": "done" if error is None else "failed",
+            "result": result,
+            "error": error,
+            "permanent": permanent,
+        }, timeout=30)
+    except LeaseLost as exc:
+        log(f"job {job_id}: lease lost, result not recorded (job was requeued): {exc}")
+        return False
+    return True
 
 
 def publish_manifest(skills: dict[str, dict]) -> None:
@@ -399,8 +437,13 @@ class Heartbeater:
         while not self.done.wait(HEARTBEAT_INTERVAL):
             try:
                 heartbeat(self.job_id)
+            except LeaseLost as exc:
+                # Nothing a further heartbeat can fix: the queue reissued it.
+                log(f"job {self.job_id}: lease lost, no more heartbeats "
+                    f"(job keeps running): {exc}")
+                return
             except QueueError as exc:
-                log(f"  heartbeat failed (job keeps running): {exc}")
+                log(f"job {self.job_id}: heartbeat failed (job keeps running): {exc}")
 
     def __enter__(self):
         self.thread.start()
@@ -491,8 +534,6 @@ def handle(job: dict, skills: dict[str, dict]) -> None:
     permanent = code == 2
     log(f"job {job_id}: exit {code} after {took:.0f}s ({'permanent' if permanent else 'transient'})")
     complete(job_id, error=tail(err) or f"exit {code} with no stderr", permanent=permanent)
-    if permanent:
-        alert(f"Job failed: {job_type}", tail(err, lines=4, limit=300))
 
 
 # ---------------------------------------------------------------------------
@@ -506,9 +547,9 @@ def check(skills: dict[str, dict]) -> int:
     print(f"skills dir {SKILLS_DIR}")
     print(f"vault      {VAULT}")
     print(f"python     {sys.executable}")
-    print(f"timeouts   poll {POLL_WAIT}s, job {JOB_TIMEOUT}s, heartbeat {HEARTBEAT_INTERVAL}s")
+    print(f"timeouts   poll every {POLL_INTERVAL:g}s, lease {LEASE_SECONDS}s, "
+          f"job {JOB_TIMEOUT}s, heartbeat {HEARTBEAT_INTERVAL}s")
     print(f"catalog    {'off' if PUBLISH_CATALOG in OFF else f'on, full push every {CATALOG_RECONCILE_S}s'}")
-    print(f"ntfy       {NTFY_TOPIC or '(unset)'}")
     print()
 
     if not QUEUE_URL:
@@ -551,9 +592,124 @@ def check(skills: dict[str, dict]) -> int:
     return 1 if problems else 0
 
 
+PARAM_TYPES = {"string", "integer", "number", "boolean", "array", "object"}
+
+
+def validate_manifest(manifest: dict) -> list[str]:
+    """Problems that would make fi-hub refuse or mis-validate this skill.
+
+    fi-hub's enqueue_job accepts only parameters a skill declares, with the
+    declared type and enum, so an incomplete manifest makes a working skill
+    unusable from Claude. Offline: nothing here touches the network.
+    """
+    name = manifest.get("type") or "(no type)"
+    out: list[str] = []
+    if not isinstance(manifest.get("summary"), str) or not manifest["summary"].strip():
+        out.append(f"{name}: no summary")
+    params = manifest.get("params")
+    if not isinstance(params, dict) or params.get("type") != "object":
+        out.append(f"{name}: params must be an object schema (type: object)")
+        params = {}
+    props = params.get("properties") or {}
+    if not isinstance(props, dict):
+        out.append(f"{name}: params.properties must be a mapping")
+        props = {}
+    for pname, spec in props.items():
+        ptype = spec.get("type") if isinstance(spec, dict) else None
+        if ptype not in PARAM_TYPES:
+            out.append(f"{name}: param {pname!r} has type {ptype!r}, "
+                       f"allowed: {', '.join(sorted(PARAM_TYPES))}")
+        enum = spec.get("enum") if isinstance(spec, dict) else None
+        if enum is not None and (not isinstance(enum, list) or not enum):
+            out.append(f"{name}: param {pname!r} has an empty or non-list enum")
+    required = params.get("required") or []
+    if not isinstance(required, list):
+        out.append(f"{name}: params.required must be a list")
+        required = []
+    for r in required:
+        if r not in props:
+            out.append(f"{name}: required param {r!r} is not declared in properties")
+    dur = manifest.get("typical_duration_s")
+    if not isinstance(dur, (int, float)) or isinstance(dur, bool) or dur <= 0:
+        out.append(f"{name}: typical_duration_s missing (Fi quotes it against a job's age)")
+    if not isinstance(manifest.get("produces"), list):
+        out.append(f"{name}: produces must be a list")
+    if not isinstance(manifest.get("idempotent"), bool):
+        out.append(f"{name}: idempotent must be true or false")
+    return out
+
+
+def probe(skills: dict[str, dict]) -> int:
+    """Prove the queue is reachable over HTTPS and accepts our token.
+
+    Calls only GET /healthz, which the queue does not count as "the Mac was
+    seen". Polling, a heartbeat, a completion and a manifest publish all do,
+    and a probe that made one would make a dead worker look alive. The token is
+    never printed.
+    """
+    print(f"queue      {QUEUE_URL or '(unset)'}")
+    print(f"token      {'set' if QUEUE_TOKEN else '(unset)'}")
+    cert = os.environ.get("SSL_CERT_FILE")
+    print(f"tls        SSL_CERT_FILE={cert or '(unset)'}"
+          + (f" ({'exists' if Path(cert).is_file() else 'MISSING'})" if cert else ""))
+    print()
+    failed = False
+
+    def fail(msg: str) -> None:
+        nonlocal failed
+        failed = True
+        print(f"FAIL  {msg}")
+
+    if not QUEUE_URL:
+        fail("QUEUE_URL is unset")
+        return 1
+    if not QUEUE_URL.startswith("https://"):
+        print("NOTE  QUEUE_URL is not https")
+
+    try:
+        status, body = call("GET", "/healthz", timeout=15)
+        ok = isinstance(body, dict) and body.get("ok") is True
+        print(f"ok    reachable, TLS ok, token accepted: GET /healthz -> {status}"
+              + ("" if ok else " (but body.ok is not true)"))
+        failed |= not ok
+    except TLSError as exc:
+        fail(f"TLS: {exc}")
+    except AuthError:
+        print("ok    reachable, TLS ok")
+        fail("auth: the queue answered 401 to our token (wrong or rotated QUEUE_TOKEN)")
+    except QueueError as exc:
+        fail(f"reachability: {exc}")
+
+    try:
+        call("GET", "/healthz", timeout=15, auth=False)
+        print("NOTE  /healthz answered 200 without a token (expected 401)")
+    except AuthError:
+        print("ok    the queue refuses a request with no token (401)")
+    except TLSError as exc:
+        fail(f"TLS (no-token request): {exc}")
+    except QueueError as exc:
+        fail(f"reachability (no-token request): {exc}")
+
+    print()
+    problems = [p for s in skills.values() for p in validate_manifest(s["manifest"])]
+    if not skills:
+        problems.append(f"no skills found under {SKILLS_DIR}")
+    for p in problems:
+        fail(f"manifest: {p}")
+    if not problems:
+        print(f"ok    {len(skills)} local manifest(s) valid: {', '.join(sorted(skills))}")
+
+    print()
+    print("probe failed" if failed else "probe passed")
+    return 1 if failed else 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--check", action="store_true", help="validate config, touch no network")
+    ap.add_argument("--probe", action="store_true",
+                    help="GET /healthz over HTTPS (with and without the token) and "
+                         "validate local manifests; never counts as 'Mac seen'")
     ap.add_argument("--once", action="store_true", help="handle one job, then exit")
     args = ap.parse_args()
 
@@ -561,6 +717,8 @@ def main() -> int:
 
     if args.check:
         return check(skills)
+    if args.probe:
+        return probe(skills)
 
     if not QUEUE_URL:
         log("ERROR: QUEUE_URL is unset")
@@ -590,13 +748,23 @@ def main() -> int:
             job = lease_next()
             backoff = 1
         except QueueError as exc:
-            # The laptop is off the network often. That is normal, not an error.
-            log(f"queue unavailable, retrying in {backoff}s: {exc}")
+            # The laptop is off the network often. That is normal, not an
+            # error. But a refused token and a failed handshake are not
+            # outages, and calling them one hides the real cause.
+            if isinstance(exc, AuthError):
+                what = "queue refused the token (check QUEUE_TOKEN)"
+            elif isinstance(exc, TLSError):
+                what = "TLS failure (not an outage)"
+            else:
+                what = "queue unavailable"
+            log(f"{what}, retrying in {backoff}s: {exc}")
             stop.wait(backoff)
             backoff = min(backoff * 2, BACKOFF_MAX)
             continue
 
         if job is None:
+            # 204: the queue answered at once. Sleep, or this loop spins.
+            stop.wait(POLL_INTERVAL)
             continue
 
         try:

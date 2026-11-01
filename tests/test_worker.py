@@ -12,8 +12,13 @@ Every test runs against an in-process stub queue, and VAULT_DIR always points
 into tmp_path. Nothing reaches the VPS or the real vault.
 """
 
+import socket
+import ssl
 import sys
+import threading
 import time
+import urllib.error
+from pathlib import Path
 
 import pytest
 
@@ -48,11 +53,11 @@ def load_worker(load, skills_root, queue_url="http://127.0.0.1:1", **env):
         "QUEUE_URL": queue_url,
         "QUEUE_TOKEN": "test-token",
         "POLL_WAIT": "1",
+        "POLL_INTERVAL": "1",
         "JOB_TIMEOUT": "30",
         "HEARTBEAT_INTERVAL": "30",
         "PUBLISH_MANIFEST": "0",
         "PUBLISH_CATALOG": "0",
-        "NTFY_TOPIC": "",
         **env,
     })
 
@@ -699,3 +704,371 @@ def test_startup_publishes_a_full_snapshot(load, skills, vault, note, stub_queue
         sent = q.catalogs()
     assert sent[0]["full"] is True
     assert [n["path"] for n in sent[0]["notes"]] == [f"transcripts/{NOTE}"]
+
+
+# ---------------------------------------------------------------------------
+# fi-hub transport (milestone 1)
+#
+# The queue is now an HTTPS short-poll Cloudflare Worker. What these protect:
+#   - a TLS failure is not "queue unreachable", and a 401 is not an outage
+#   - an empty poll sleeps, or the loop spins and exhausts the Free plan
+#   - --probe proves the link without ever counting as "the Mac was seen"
+#   - a lost lease (409) is logged, stops heartbeating, and never crashes
+#   - the Mac sends no pushes
+# ---------------------------------------------------------------------------
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+class NotTLS:
+    """A TCP server that answers any connection with plain HTTP text.
+
+    Pointed at by an https:// URL, the client's handshake fails with a real
+    ssl.SSLError ("wrong version number"). Hermetic: no certificates needed.
+    """
+
+    def __init__(self):
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(5)
+        self.url = f"https://127.0.0.1:{self.sock.getsockname()[1]}"
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            try:
+                conn.sendall(b"HTTP/1.1 400 Bad Request\r\n\r\n")
+            except OSError:
+                pass
+            conn.close()
+
+    def close(self):
+        self.sock.close()
+
+
+@pytest.fixture
+def not_tls():
+    server = NotTLS()
+    yield server
+    server.close()
+
+
+def run_main(w, monkeypatch, seconds, args=("worker.py",)):
+    """Run main() for a bounded time, then ask it to stop."""
+    monkeypatch.setattr(w.signal, "signal", lambda *a: None)
+    monkeypatch.setattr(sys, "argv", list(args))
+    timer = threading.Timer(seconds, w.stop.set)
+    timer.start()
+    try:
+        return w.main()
+    finally:
+        timer.cancel()
+
+
+def test_tls_failure_is_reported_as_tls_not_unreachable(load, skills, not_tls):
+    w = load_worker(load, skills, queue_url=not_tls.url)
+    with pytest.raises(w.TLSError) as exc:
+        w.call("GET", "/jobs/next", timeout=5)
+    assert "TLS failure" in str(exc.value)
+    assert "unreachable" not in str(exc.value)
+
+
+def test_certificate_verify_failure_is_a_tls_error(load, skills, monkeypatch):
+    """What a missing SSL_CERT_FILE looks like: urlopen wraps it in URLError."""
+    w = load_worker(load, skills, queue_url="https://fi-hub.invalid/worker")
+    cause = ssl.SSLCertVerificationError("CERTIFICATE_VERIFY_FAILED")
+
+    def refuse(*a, **k):
+        raise urllib.error.URLError(cause)
+
+    monkeypatch.setattr(w.urllib.request, "urlopen", refuse)
+    with pytest.raises(w.TLSError) as exc:
+        w.call("GET", "/healthz")
+    assert "CERTIFICATE_VERIFY_FAILED" in str(exc.value)
+    assert "SSL_CERT_FILE" in str(exc.value), "the message must point at the fix"
+
+
+def test_a_bare_ssl_error_is_a_tls_error(load, skills, monkeypatch):
+    w = load_worker(load, skills, queue_url="https://fi-hub.invalid/worker")
+
+    def refuse(*a, **k):
+        raise ssl.SSLError("handshake")
+
+    monkeypatch.setattr(w.urllib.request, "urlopen", refuse)
+    with pytest.raises(w.TLSError):
+        w.call("GET", "/healthz")
+
+
+def test_an_unreachable_queue_is_not_a_tls_error(load, skills):
+    w = load_worker(load, skills, queue_url="http://127.0.0.1:1")
+    with pytest.raises(w.QueueError) as exc:
+        w.call("GET", "/healthz")
+    assert not isinstance(exc.value, w.TLSError)
+    assert "unreachable" in str(exc.value)
+
+
+def test_a_401_is_an_auth_error_and_other_http_errors_are_not(load, skills, stub_queue):
+    with stub_queue(token="right") as q:
+        w = load_worker(load, skills, queue_url=q.url, QUEUE_TOKEN="wrong")
+        with pytest.raises(w.AuthError):
+            w.call("GET", "/healthz")
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        with pytest.raises(w.QueueError) as exc:
+            w.call("GET", "/nope")
+    assert not isinstance(exc.value, (w.AuthError, w.TLSError))
+
+
+def test_main_loop_logs_tls_failure_as_such(load, skills, not_tls, monkeypatch, capsys):
+    w = load_worker(load, skills, queue_url=not_tls.url)
+    run_main(w, monkeypatch, 1.5)
+    out = capsys.readouterr().out
+    assert "TLS failure" in out
+    assert "queue unavailable" not in out
+
+
+def test_main_loop_logs_a_refused_token_as_such(
+    load, skills, stub_queue, monkeypatch, capsys
+):
+    with stub_queue(token="right") as q:
+        w = load_worker(load, skills, queue_url=q.url, QUEUE_TOKEN="wrong")
+        run_main(w, monkeypatch, 1.5)
+    out = capsys.readouterr().out
+    assert "refused the token" in out
+    assert "queue unavailable" not in out
+    assert "wrong" not in out, "the token must never reach the log"
+
+
+def test_main_loop_still_calls_an_outage_an_outage(load, skills, monkeypatch, capsys):
+    w = load_worker(load, skills, queue_url="http://127.0.0.1:1")
+    run_main(w, monkeypatch, 1.5)
+    assert "queue unavailable" in capsys.readouterr().out
+
+
+def test_an_empty_poll_sleeps_instead_of_spinning(load, skills, stub_queue, monkeypatch):
+    """fi-hub answers 204 at once. Without the sleep this is hundreds of calls a
+    second, and the Free plan allows 100,000 requests a day."""
+    with stub_queue(jobs=[]) as q:
+        w = load_worker(load, skills, queue_url=q.url, POLL_INTERVAL="1")
+        run_main(w, monkeypatch, 2.5)
+        polls = len(q.polls())
+    assert 2 <= polls <= 4, f"expected about one poll a second, saw {polls}"
+
+
+def test_the_poll_sleep_is_interruptible(load, skills, stub_queue, monkeypatch):
+    with stub_queue(jobs=[]) as q:
+        w = load_worker(load, skills, queue_url=q.url, POLL_INTERVAL="30")
+        started = time.time()
+        run_main(w, monkeypatch, 0.5)
+    assert time.time() - started < 5, "SIGTERM must not wait out the poll interval"
+
+
+def test_poll_interval_has_a_floor(load, skills):
+    """0 would be the spin again."""
+    w = load_worker(load, skills, POLL_INTERVAL="0")
+    assert w.POLL_INTERVAL >= 1
+
+
+def test_poll_sends_worker_wait_and_explicit_lease(load, skills, stub_queue):
+    with stub_queue(jobs=[]) as q:
+        w = load_worker(load, skills, queue_url=q.url, WORKER_NAME="mac")
+        w.lease_next()
+        query = q.polls()[0]
+    assert query["worker"] == ["mac"]
+    assert query["wait"] == ["1"]
+    assert query["lease"] == ["120"]
+
+
+def test_heartbeat_names_the_worker_in_the_body_and_asks_for_the_lease(
+    load, skills, stub_queue
+):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url, WORKER_NAME="mac")
+        w.heartbeat("j1")
+        beat = [b for m, p, b in q.calls if p == "/jobs/j1/heartbeat"][0]
+        assert q.last_query == {"lease": ["120"]}
+    assert beat == {"worker": "mac"}
+
+
+def test_a_lost_lease_stops_the_heartbeats_and_names_the_job(
+    load, tmp_path, stub_queue, capsys
+):
+    root = tmp_path / "skills"
+    make_skill(root, "slow", "import time; time.sleep(3.5); print('{}')")
+    with stub_queue(heartbeat_status=409) as q:
+        w = load_worker(load, root, queue_url=q.url, HEARTBEAT_INTERVAL="1")
+        w.handle({"id": "job-xyz", "type": "slow", "params": {}}, w.load_skills(root))
+        beats = [p for m, p, b in q.calls if p.endswith("/heartbeat")]
+    out = capsys.readouterr().out
+    assert len(beats) == 1, "keep heartbeating a job the queue already reissued?"
+    assert "job-xyz" in out and "lease lost" in out
+
+
+def test_a_409_on_complete_is_logged_and_not_fatal(load, skills, stub_queue, capsys):
+    with stub_queue(complete_status=409) as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        assert w.complete("job-abc", result={"ok": True}) is False
+        w.handle({"id": "job-abc", "type": "good_skill", "params": {}},
+                 w.load_skills(skills))      # must not raise
+    out = capsys.readouterr().out
+    assert "job-abc" in out and "lease lost" in out
+
+
+def test_the_note_is_still_pushed_when_the_lease_was_lost(
+    load, skills, stub_queue, monkeypatch
+):
+    """The skill wrote the note whether or not the queue recorded the result."""
+    pushed = []
+    with stub_queue(complete_status=409) as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        monkeypatch.setattr(w, "catalog_after", lambda result: pushed.append(result))
+        w.handle({"id": "j1", "type": "good_skill", "params": {}}, w.load_skills(skills))
+    assert len(pushed) == 1
+
+
+def test_complete_returns_true_when_recorded(load, skills, stub_queue):
+    with stub_queue() as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        assert w.complete("j1", result={}) is True
+
+
+# --- --probe ---------------------------------------------------------------
+
+def run_probe(w, skills_root, monkeypatch):
+    monkeypatch.setattr(sys, "argv", ["worker.py", "--probe"])
+    return w.main()
+
+
+def test_probe_passes_against_a_healthy_queue(load, skills, stub_queue, monkeypatch, capsys):
+    skill = skills / "good_skill" / "skill.yaml"
+    skill.write_text(
+        "type: good_skill\nsummary: ok\nparams:\n  type: object\n  required: [x]\n"
+        "  properties:\n    x: {type: string}\nproduces: [a]\n"
+        "typical_duration_s: 5\nidempotent: true\n", encoding="utf-8")
+    with stub_queue(token="test-token") as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        assert run_probe(w, skills, monkeypatch) == 0
+        paths = [(m, p) for m, p, _ in q.calls]
+    out = capsys.readouterr().out
+    assert "probe passed" in out
+    assert "test-token" not in out
+    assert "token      set" in out
+    assert "refuses a request with no token" in out
+    assert paths == [("GET", "/healthz"), ("GET", "/healthz")]
+
+
+def test_probe_never_makes_a_call_the_queue_counts_as_the_mac_being_seen(
+    load, skills, stub_queue, monkeypatch
+):
+    """A poll, heartbeat, completion or manifest publish flips queue_status to
+    'awake'. A probe that did any of them would hide a dead worker."""
+    with stub_queue(token="test-token", jobs=[{"id": "j", "type": "good_skill"}]) as q:
+        w = load_worker(load, skills, queue_url=q.url, PUBLISH_MANIFEST="auto")
+        run_probe(w, skills, monkeypatch)
+        paths = {p for _, p, _ in q.calls}
+        assert len(q.jobs) == 1, "the probe must not lease a job"
+    assert paths == {"/healthz"}
+
+
+def test_probe_sends_the_second_request_without_the_token(
+    load, skills, stub_queue, monkeypatch
+):
+    with stub_queue(token="test-token") as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        run_probe(w, skills, monkeypatch)
+        assert q.token_seen is None
+
+
+def test_probe_reports_a_refused_token_and_does_not_print_it(
+    load, skills, stub_queue, monkeypatch, capsys
+):
+    with stub_queue(token="right") as q:
+        w = load_worker(load, skills, queue_url=q.url, QUEUE_TOKEN="sekrit-wrong")
+        assert run_probe(w, skills, monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert "auth" in out and "401" in out
+    assert "sekrit-wrong" not in out
+
+
+def test_probe_reports_tls_separately(load, skills, not_tls, monkeypatch, capsys):
+    w = load_worker(load, skills, queue_url=not_tls.url, QUEUE_TOKEN="sekrit")
+    assert run_probe(w, skills, monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert "TLS" in out and "reachability" not in out
+    assert "sekrit" not in out
+
+
+def test_probe_reports_reachability_separately(load, skills, monkeypatch, capsys):
+    w = load_worker(load, skills, queue_url="http://127.0.0.1:1", QUEUE_TOKEN="sekrit")
+    assert run_probe(w, skills, monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert "reachability" in out and "TLS:" not in out
+    assert "sekrit" not in out
+
+
+def test_probe_fails_on_a_manifest_fi_hub_would_mis_validate(
+    load, skills, stub_queue, monkeypatch, capsys
+):
+    (skills / "good_skill" / "skill.yaml").write_text(
+        "type: good_skill\nsummary: ok\nparams:\n  type: object\n"
+        "  required: [missing]\n  properties:\n    x: {type: 'null'}\n"
+        "idempotent: true\nproduces: [a]\n", encoding="utf-8")
+    with stub_queue(token="test-token") as q:
+        w = load_worker(load, skills, queue_url=q.url)
+        assert run_probe(w, skills, monkeypatch) == 1
+    out = capsys.readouterr().out
+    assert "typical_duration_s" in out
+    assert "not declared in properties" in out
+    assert "allowed:" in out
+
+
+def test_the_real_manifests_validate(load, skills):
+    """The skills Fi will actually call must declare every param, with types."""
+    w = load_worker(load, skills, SKILLS_DIR=str(ROOT))
+    real = w.load_skills(ROOT)
+    assert {"transcribe_video", "summarize_transcript", "summarize_url"} <= set(real)
+    for name, skill in real.items():
+        assert w.validate_manifest(skill["manifest"]) == [], name
+
+
+def test_check_stays_offline(load, skills, monkeypatch, capsys):
+    """--check must not open a socket, whatever QUEUE_URL says."""
+    w = load_worker(load, skills, queue_url="https://fi-hub.invalid/worker")
+
+    def no_network(*a, **k):
+        raise AssertionError("--check touched the network")
+
+    monkeypatch.setattr(w.urllib.request, "urlopen", no_network)
+    monkeypatch.setattr(sys, "argv", ["worker.py", "--check"])
+    assert w.main() == 0
+
+
+# --- ntfy leaves the Mac ---------------------------------------------------
+
+def test_the_worker_no_longer_sends_pushes(load, tmp_path, stub_queue, monkeypatch):
+    """Pushes are server-side now. Even with the old variable still set, a
+    permanent failure must not reach ntfy."""
+    root = tmp_path / "skills"
+    make_skill(root, "permanent", SKILL_PERMANENT)
+    with stub_queue() as q:
+        w = load_worker(load, root, queue_url=q.url, NTFY_TOPIC="a-topic")
+        seen = []
+        real = w.urllib.request.urlopen
+
+        def spy(req, *a, **k):
+            seen.append(req.full_url)
+            return real(req, *a, **k)
+
+        monkeypatch.setattr(w.urllib.request, "urlopen", spy)
+        w.handle({"id": "j1", "type": "permanent", "params": {}}, w.load_skills(root))
+    assert not hasattr(w, "alert") and not hasattr(w, "NTFY_TOPIC")
+    assert seen and all(u.startswith(q.url) for u in seen), seen
+
+
+def test_ntfy_is_gone_from_the_worker_and_its_config():
+    for rel in ("worker.py", "com.hermes.worker.plist", ".env.example"):
+        assert "ntfy" not in (ROOT / rel).read_text(encoding="utf-8").lower(), rel
