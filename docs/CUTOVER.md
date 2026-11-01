@@ -1,17 +1,18 @@
 # Cutover: Mac worker from the VPS queue to fi-hub
 
-**Status: acceptance scenarios 1 to 5 done; the second-account refusal gate (scenario 6) is
-NOT done, so the cutover is not complete and nothing on the VPS may be touched.** No secrets are
-in this file, only their names.
+**Status: soak running since 2026-11-01. Acceptance scenarios 1 to 5 passed. The
+second-account refusal gate (scenario 6) is NOT done: the fi-hub session will run it with
+option B and report; until it passes, nothing on the VPS may be touched.** No secrets are in this
+file, only their names.
 
 | | |
 |---|---|
 | Date | 2026-11-01 |
-| Branch | `feat/fi-hub-backend` (not merged, not pushed) |
-| Rollback tag | `pre-fi-hub` on `main` at `3b43969` (local only) |
+| Branch | `feat/fi-hub-backend`, pushed; CI green on its head. `main` needs a pull request (see Publishing). |
+| Rollback tag | `pre-fi-hub` on `main` at `3b43969`, pushed |
 | Old installed plist | `~/Library/LaunchAgents/com.hermes.worker.plist.pre-fi-hub` (mode 600) |
 | Queue | `https://fi-hub.REPLACE_ME.workers.dev/worker` |
-| Soak start | **not started.** It starts the day the refusal gate passes; fill the date in then: `____-__-__`. |
+| Soak start | **2026-11-01**, by the owner's decision at the end of Milestone 4. The VPS stays up and untouched for the soak. |
 
 ## What was done
 
@@ -101,18 +102,19 @@ matters only if a note is edited somewhere that rewrites line endings. Fixing it
 | 3 | A failing job ends `failed`, shows its error, is not retried | **Pass, with `example.com`, not an X link** | `2be15378…` `summarize_url`: `failed`, `attempts 1 of 3`, error "only 156 characters of text extracted…", log `exit 2 after 1s (permanent)`, no retry, no stray note. The X-link rejection (same exit 2, before any network call) is covered by the skill's own tests, not exercised through the Hub. |
 | 4 | Kill the worker mid-job: lease expires, job requeues after the retry delay, one note, summary intact | **Pass** | `f2b1750a…` `summarize_transcript` (`force`, `detailed`), Mac on AC power with no Sleep/DarkWake entry in the window. Leased 17:30:23, worker SIGKILLed 17:30:35 (12 s in), `queued` after the lease expired at 17:32:23 with "will retry in about 1m", re-leased 17:34:27, done 17:35:54 (87 s), pushed 17:35:58. `done`, `attempts 2`. One of 10 files; one summary block; the transcript sha256 and the frontmatter sha256 are identical to the copy taken before; the note was byte-identical after the killed attempt (nothing written); no `.tmp`, no orphan process. |
 | 5 | `queue_status` shows `worker_last_seen_s` as a number | **Pass** | `2`, `5`, `0`, `15` seen across the session; `mac_status: awake`; `skills_published: 3` |
-| 6 | **Second-account refusal (hard gate)** | **NOT DONE** | The owner chooses option A (second GitHub account, private window) or B (temporarily wrong `ALLOWED_GITHUB_ID` on `fi-hub-auth`, restored and verified as `12057985`). Record the result here when done. |
+| 6 | **Second-account refusal (hard gate)** | **NOT DONE** | The owner chose **option B** (temporarily wrong `ALLOWED_GITHUB_ID` on `fi-hub-auth`, then restored and verified as `12057985`), to be run by the fi-hub session. Result: `__ pending __`. Record it here when the owner reports it. |
 
 ### Not proven by the acceptance run
 - **Time until a new note is searchable.** The only searches ran against notes already in the
   index, which return the note whatever the age of the new text, and the passage returned was
   not the changed summary. A fair measurement needs a brand-new note and distinct queries.
   fi-hub documents 70 to 90 s (HANDOFF section 9); not confirmed here.
-- **Deduplication** (`deduplicated: true` on a repeated request): the Hub shows one job, which is
-  consistent, but whether it was requested twice is the owner's to confirm.
 - **A job queued through a long, full sleep** (as opposed to a DarkWake). Not observed.
 - A transient failure retried twice and then `dead`, and a job or parameter not in the
   manifest being refused at enqueue (HANDOFF 11.12 item 3): not run in this pass.
+
+### Confirmed afterwards
+- **Deduplication:** the owner sent the scenario 2 request twice; the Hub holds one job for it.
 
 ### Findings from the acceptance run
 - **`launchd` kills the skill with the worker.** Killing only the worker pid left no orphan
@@ -125,6 +127,28 @@ matters only if a note is edited somewhere that rewrites line endings. Fixing it
   parked (HANDOFF section 9); the job was unaffected.
 - **For the fi-hub session:** count lease expiries separately from real failures, so a job that
   slept through its lease is not reported as a failure or sent to `dead` for it.
+
+## Publishing
+
+The repository is public, so before anything was pushed every line added by the 12 commits was
+scanned (secret and private-detail patterns, each with a positive control that had to match its
+own synthetic sample, plus a negative control). Result: no secret. Findings and decisions:
+
+- **The account's `workers.dev` subdomain was in the plist template, `.env.example` and this
+  file and was not public anywhere.** The unpublished commits were rewritten (a local rewrite,
+  not a force push) to use `REPLACE_ME`. The installed plist keeps the real URL; fill in the
+  template's placeholder when rebuilding from it. A local backup branch holds the pre-rewrite
+  history and was not pushed.
+- The git author email was already on published commits; unchanged.
+- The numeric GitHub id of the account is public data and was left in this file.
+- The one "secret" pattern hit was a fake `NTFY_TOPIC` literal in a test.
+
+Pushed: `feat/fi-hub-backend` and the `pre-fi-hub` tag (no force). CI in this repository runs
+only on pushes to `main`, pull requests and manual dispatch, so it was run by dispatch on the
+branch head: pyflakes, pyright and pytest passed. **`main` is protected by a ruleset with no
+bypass: a direct push was declined, and changes must arrive through a pull request.** `main`
+was not changed. Open the pull request and merge it (the repository's history uses merge
+commits).
 
 ## What passed (Milestone 3)
 
@@ -144,9 +168,9 @@ the absence of errors after the reload and is confirmed by `queue_status`
 
 - **The second-account refusal check.** A hard gate: it must pass before anyone touches the VPS.
 - Anything on the VPS: Hermes, `queue.service`, Telegram or API keys, OpenClaw. Not touched,
-  not decommissioned, not rotated. That is a separate stage with a separate go.
+  not decommissioned, not rotated. That is a separate stage with a separate go, after the soak.
 - The items listed under "Not proven by the acceptance run".
-- The branch is not merged or pushed, and the `pre-fi-hub` tag is not pushed.
+- `feat/fi-hub-backend` is not merged into `main` (needs a pull request).
 - The token file `~/.config/fi-hub/worker-token-new` still exists (mode 600), at the owner's
   request. Delete it when it is no longer needed.
 
