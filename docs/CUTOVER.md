@@ -54,6 +54,29 @@ Stage 2's checks used curl, which is why they passed.
 request after SIGTERM. A `bootstrap` issued at once fails with `Input/output error` (exit 5).
 Wait until the old pid is gone, then bootstrap. Nothing is wrong when that happens.
 
+### A sleeping Mac still polls: DarkWake windows (found in scenario 2)
+The Mac does not stay silent while asleep. About every 15 minutes it wakes for roughly 45 s
+(`pmset -g log`: Wi-Fi TCP-keepalive offload, `E_TKO_TCP_DATA` / `E_TKO_UNEXPECT_TCP_FLAG`;
+plus scheduled `rtc/Maintenance` from `mDNSResponder` and `dasd`). Settings: `powernap 1`,
+`tcpkeepalive 1`, `womp 0`. Which connection causes the keepalive wakes is not known.
+
+What happened: job `459ce7db…` was enqueued at 14:42:31 inside a DarkWake, leased at
+14:42:37, and the Mac went back to sleep at 14:42:44, **seven seconds into the job**, with
+`caffeinate`'s assertions (including `PreventSystemSleep`) in place. `-s` is honoured only on
+AC power; this was battery. The job's process was frozen for 15 min and could not heartbeat.
+At the next DarkWake it finished ("done in 913s"), `complete` answered 409 because the lease
+had expired and the job was requeued, the worker logged `lease lost, result not recorded`,
+**still pushed the note**, re-leased the job (attempt 2), re-ran it in 9 s and completed it.
+Outcome: one note, one job `done` with `attempts 2`, no duplicate, no leftover process.
+
+Consequence: a job that needs more awake time than a window offers, queued while the Mac
+sleeps, can lose its lease on every attempt and go `dead` after 3, with the work done up to 3
+times. Short jobs fit. This is a property of the platform, not of the worker; delivery
+being at-least-once is what makes it survivable. Recorded in `CLAUDE.md`.
+
+Open items: the hub should count lease expiries separately from failures (to be queued for
+the fi-hub session). No power setting was changed and `caffeinate -u` is untested.
+
 ### CRLF notes are not indexed (known limit, predates this work)
 `skilllib.notefmt.FRONTMATTER` requires `---\n`. A note saved with `\r\n` line endings has no
 recognised frontmatter and is skipped by the notes push. The skills only write LF, so this

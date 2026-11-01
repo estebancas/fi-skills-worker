@@ -123,8 +123,36 @@ slow job is not requeued under it. The default lease is 120s.
 
 - **The manifests are the allowlist.** A job type with no `skill.yaml` is rejected as a
   permanent failure. Fi cannot name a script that was not declared.
-- **`caffeinate -dims` wraps the job, not the worker** — this is a laptop. It stays awake
-  exactly while a job runs.
+- **`caffeinate -dims` wraps the job, not the worker** — this is a laptop, and we do not
+  want it awake for the worker's whole uptime. It holds off *idle* sleep while a job runs.
+  **It does not hold off a maintenance sleep during a DarkWake on battery** (see below).
+
+### A sleeping Mac still polls: DarkWake windows
+A "sleeping" Mac is not silent. macOS wakes it about every 15 minutes for roughly 45 seconds
+(a DarkWake: the Wi-Fi chip's TCP-keepalive offload, `E_TKO_*` in `pmset -g log`; plus
+scheduled maintenance from `mDNSResponder` and `dasd`). The worker polls inside that window
+and can lease a job. Measured on 2026-11-01: `caffeinate` created its assertions, including
+`PreventSystemSleep`, seven seconds into the job, and the Mac entered "Maintenance Sleep"
+anyway, because `-s` is honoured only on AC power. The job's process was frozen for 15
+minutes, with no heartbeat while asleep.
+
+What follows from that, none of it a bug in the worker:
+- A job leased in a DarkWake and not finished before the Mac sleeps again **loses its
+  lease** (120 s, no heartbeat while asleep). When the Mac next wakes the work resumes and
+  finishes, but `complete` answers 409 and the job has already been requeued.
+- It then runs again (attempt 2), which is safe because every skill is. Observed: one note,
+  `attempts 2`, `done`.
+- A job that needs more awake time than one window offers can lose its lease on every
+  attempt and go `dead` after `max_attempts` (3), **with the work done up to three times**.
+  Treat a `dead` job with "lease expired" as "probably slept", not as a failure, and check
+  the vault.
+- Short jobs (under about 30 s) usually fit. Anything long (whisper, a big summary) is at
+  risk if it is *queued while the Mac sleeps*; started while the Mac is awake and on AC, it is
+  fine.
+- The hub should count lease expiries separately from real failures; that is a fi-hub change.
+
+Not done, deliberately: no power setting was changed, and `caffeinate -u` (which could
+promote the DarkWake to a full wake) is untested.
 - **An unreachable queue is not an error.** Backoff 1s → 60s, because being off the
   network is this machine's normal state. A failed TLS handshake and a refused token
   (HTTP 401) are *not* outages and are logged as what they are: calling them "queue
