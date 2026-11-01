@@ -1,8 +1,8 @@
 # Cutover: Mac worker from the VPS queue to fi-hub
 
-**Status: in progress (end of Milestone 3).** Milestone 4, the end-to-end acceptance and the
-second-account refusal gate, has not been done. This file is completed then. No secrets are in
-it, only their names.
+**Status: acceptance scenarios 1 to 5 done; the second-account refusal gate (scenario 6) is
+NOT done, so the cutover is not complete and nothing on the VPS may be touched.** No secrets are
+in this file, only their names.
 
 | | |
 |---|---|
@@ -11,7 +11,7 @@ it, only their names.
 | Rollback tag | `pre-fi-hub` on `main` at `3b43969` (local only) |
 | Old installed plist | `~/Library/LaunchAgents/com.hermes.worker.plist.pre-fi-hub` (mode 600) |
 | Queue | `https://fi-hub.REPLACE_ME.workers.dev/worker` |
-| Soak start | not started (starts when Milestone 4 passes) |
+| Soak start | **not started.** It starts the day the refusal gate passes; fill the date in then: `____-__-__`. |
 
 ## What was done
 
@@ -92,6 +92,40 @@ matters only if a note is edited somewhere that rewrites line endings. Fixing it
   `NTFY_TOPIC`, and the keys the template added (`POLL_INTERVAL`, `PUBLISH_CATALOG`,
   `CATALOG_RECONCILE_S`, `FETCH_*`).
 
+## Acceptance (Milestone 4, driven from the phone through Fi; checked against the Hub and the log)
+
+| # | Scenario | Result | Evidence |
+|---|---|---|---|
+| 1 | A YouTube link becomes a job, runs on the Mac, the note is searchable | **Pass** (timing not measured, see below) | `transcribe_video` `9602811b…` done in 11 s, pushed `inserted 1`; `summarize_transcript` `648ba59f…` done in 17 s, pushed `updated 1`; one file, one summary block; `search_notes` returned it at score 1 |
+| 2 | Mac asleep, then woken: the job completes, no duplicate | **Pass, by a different path than planned** | Job `459ce7db…` was leased in a DarkWake and the Mac slept 7 s into it. Lease lost (HTTP 409), note still pushed, job re-leased and completed; `done`, `attempts 2`, one note. See the DarkWake finding. |
+| 3 | A failing job ends `failed`, shows its error, is not retried | **Pass, with `example.com`, not an X link** | `2be15378…` `summarize_url`: `failed`, `attempts 1 of 3`, error "only 156 characters of text extracted…", log `exit 2 after 1s (permanent)`, no retry, no stray note. The X-link rejection (same exit 2, before any network call) is covered by the skill's own tests, not exercised through the Hub. |
+| 4 | Kill the worker mid-job: lease expires, job requeues after the retry delay, one note, summary intact | **Pass** | `f2b1750a…` `summarize_transcript` (`force`, `detailed`), Mac on AC power with no Sleep/DarkWake entry in the window. Leased 17:30:23, worker SIGKILLed 17:30:35 (12 s in), `queued` after the lease expired at 17:32:23 with "will retry in about 1m", re-leased 17:34:27, done 17:35:54 (87 s), pushed 17:35:58. `done`, `attempts 2`. One of 10 files; one summary block; the transcript sha256 and the frontmatter sha256 are identical to the copy taken before; the note was byte-identical after the killed attempt (nothing written); no `.tmp`, no orphan process. |
+| 5 | `queue_status` shows `worker_last_seen_s` as a number | **Pass** | `2`, `5`, `0`, `15` seen across the session; `mac_status: awake`; `skills_published: 3` |
+| 6 | **Second-account refusal (hard gate)** | **NOT DONE** | The owner chooses option A (second GitHub account, private window) or B (temporarily wrong `ALLOWED_GITHUB_ID` on `fi-hub-auth`, restored and verified as `12057985`). Record the result here when done. |
+
+### Not proven by the acceptance run
+- **Time until a new note is searchable.** The only searches ran against notes already in the
+  index, which return the note whatever the age of the new text, and the passage returned was
+  not the changed summary. A fair measurement needs a brand-new note and distinct queries.
+  fi-hub documents 70 to 90 s (HANDOFF section 9); not confirmed here.
+- **Deduplication** (`deduplicated: true` on a repeated request): the Hub shows one job, which is
+  consistent, but whether it was requested twice is the owner's to confirm.
+- **A job queued through a long, full sleep** (as opposed to a DarkWake). Not observed.
+- A transient failure retried twice and then `dead`, and a job or parameter not in the
+  manifest being refused at enqueue (HANDOFF 11.12 item 3): not run in this pass.
+
+### Findings from the acceptance run
+- **`launchd` kills the skill with the worker.** Killing only the worker pid left no orphan
+  skill or `caffeinate` process; the whole job died. A crash therefore leaves the vault note
+  untouched (the skill writes atomically and had not reached the write) and nothing running.
+- **The Hub calls a dead worker's job "running on the Mac right now"** until its lease
+  expires (here, 2 minutes). Cosmetic, for the fi-hub session.
+- **A permanent failure's push can fail.** `queue_status` showed `notifications.failed: 1`: the
+  "Job failed: summarize_url" push never reached ntfy (`fetch threw TimeoutError`). Known and
+  parked (HANDOFF section 9); the job was unaffected.
+- **For the fi-hub session:** count lease expiries separately from real failures, so a job that
+  slept through its lease is not reported as a failure or sent to `dead` for it.
+
 ## What passed (Milestone 3)
 
 - `worker.py --check` passed under the installed plist's environment.
@@ -100,7 +134,7 @@ matters only if a note is edited somewhere that rewrites line endings. Fixing it
 - Log after the second reload: `published manifest (3 skills)`; startup push of the 8 notes
   `inserted 0, updated 0, unchanged 4` twice (two batches of four); `reconciled (deleted 0,
   pending 0, failed 0)`.
-- Suite: 291 tests pass, pyright 0 errors, pyflakes clean.
+- Suite at the time: 291 tests pass, pyright 0 errors, pyflakes clean.
 
 The first successful poll is not logged (a successful poll logs nothing). It is evidenced by
 the absence of errors after the reload and is confirmed by `queue_status`
@@ -108,11 +142,13 @@ the absence of errors after the reload and is confirmed by `queue_status`
 
 ## What was not performed
 
-- Milestone 4: the end-to-end acceptance from the phone (link to job to note, asleep and woken,
-  a failing job, a killed worker, `worker_last_seen_s`).
-- **The second-account refusal check.** It is a hard gate before anyone touches the VPS.
-- Anything on the VPS: Hermes, `queue.service`, Telegram or API keys, OpenClaw. Not decommissioned.
+- **The second-account refusal check.** A hard gate: it must pass before anyone touches the VPS.
+- Anything on the VPS: Hermes, `queue.service`, Telegram or API keys, OpenClaw. Not touched,
+  not decommissioned, not rotated. That is a separate stage with a separate go.
+- The items listed under "Not proven by the acceptance run".
 - The branch is not merged or pushed, and the `pre-fi-hub` tag is not pushed.
+- The token file `~/.config/fi-hub/worker-token-new` still exists (mode 600), at the owner's
+  request. Delete it when it is no longer needed.
 
 ## Hermes is not served
 
