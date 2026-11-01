@@ -59,7 +59,9 @@
         <string>/etc/ssl/cert.pem</string>
 
         <!-- The fi-hub Cloudflare Worker. The base includes /worker. Outbound
-             HTTPS only: the Mac accepts no inbound connection. -->
+             HTTPS only: the Mac accepts no inbound connection. Replace
+             REPLACE_ME with your account's workers.dev subdomain, in the
+             INSTALLED copy: this repo is public and the template stays generic. -->
         <key>QUEUE_URL</key>
         <string>https://fi-hub.REPLACE_ME.workers.dev/worker</string>
 
