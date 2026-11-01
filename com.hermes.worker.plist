@@ -53,6 +53,11 @@
         <key>PATH</key>
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 
+        <!-- The venv's Python has no root certificates, so HTTPS fails
+             CERTIFICATE_VERIFY_FAILED. Point OpenSSL at the system bundle. -->
+        <key>SSL_CERT_FILE</key>
+        <string>/etc/ssl/cert.pem</string>
+
         <!-- Queue service on the VPS, reached over Tailscale. Use the tailnet
              address, not a public one: the queue must not be internet-facing. -->
         <key>QUEUE_URL</key>
@@ -122,7 +127,7 @@
         <key>OLLAMA_KEEP_ALIVE</key>
         <string>30m</string>
 
-        <!-- yt-dlp cookies. --cookies-from-browser needs a Keychain unlock to
+        <!-- yt-dlp cookies. Reading cookies straight from the browser needs a Keychain unlock to
              decrypt Chrome's cookie DB, which a launchd job usually cannot get:
              it fails as a YouTube "confirm you're not a bot" error. If that
              happens, export cookies.txt and switch to COOKIES_FILE instead.
