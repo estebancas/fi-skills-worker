@@ -131,6 +131,14 @@ slow job is not requeued under it. The default lease is 120s.
   unavailable" hides a missing `SSL_CERT_FILE` or a rotated token behind a normal state.
 - **HTTPS needs `SSL_CERT_FILE=/etc/ssl/cert.pem`** (set in the plist). This Python has no
   root certificates; see *Local environment*.
+- **Every request sends `User-Agent: fi-skills-worker/1.0`, and that is load-bearing.**
+  Cloudflare's edge answers the default `Python-urllib/3.x` agent with `403 error code:
+  1010` *before the request reaches fi-hub*, so the token is never even checked. Found at
+  the first live reload: TLS worked, every call failed, and the stub-only test suite could
+  not see it because the stub is not Cloudflare. `EdgeBlocked` classifies that 403 (a body
+  naming a Cloudflare 1xxx error) and the loop and `--probe` report it as "blocked at the
+  Cloudflare edge (User-Agent?)". fi-hub itself answers 401, never 403, for a bad token.
+  `StubQueue(edge_block=...)` reproduces the edge, so dropping the header fails tests.
 - **A lost lease (HTTP 409) is logged with the job id and is not fatal.** The heartbeat
   stops, `complete()` returns False, and the note the job wrote is still pushed: the job
   will run again, which is safe, but the work on disk is real.
@@ -290,6 +298,13 @@ failure is a missing or stale note on the hub, fixed by the next push. The skill
 guard against clobbering a summary, which is not recoverable. Do not merge the two without
 moving all three onto a shared module. What has changed is the cost of a *read* going wrong:
 it publishes. That is why `load_note` confines the path first.
+
+**Known limit: a note with CRLF line endings is not indexed.** `notefmt.FRONTMATTER`
+requires `---\n`, so a file Obsidian (or anything else) saved with `\r\n` has no
+recognised frontmatter and `load_note` skips it, silently apart from the "no usable
+frontmatter" count. This predates the fi-hub work; the skills only write LF. It matters only
+if a note is ever edited somewhere that rewrites line endings. Fixing it means changing
+`skilllib`, which every skill shares, so it is left alone.
 
 A note that has never been summarised is still pushed whole; Fi can quote its transcript but
 finds no summary at the top. That is the strongest argument for chaining the two skills.
