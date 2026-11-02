@@ -97,7 +97,7 @@ matters only if a note is edited somewhere that rewrites line endings. Fixing it
 
 | # | Scenario | Result | Evidence |
 |---|---|---|---|
-| 1 | A YouTube link becomes a job, runs on the Mac, the note is searchable | **Pass** (timing not measured, see below) | `transcribe_video` `9602811b…` done in 11 s, pushed `inserted 1`; `summarize_transcript` `648ba59f…` done in 17 s, pushed `updated 1`; one file, one summary block; `search_notes` returned it at score 1 |
+| 1 | A YouTube link becomes a job, runs on the Mac, the note is searchable | **Pass** (timed on a second, fresh note: see "Confirmed afterwards") | `transcribe_video` `9602811b…` done in 11 s, pushed `inserted 1`; `summarize_transcript` `648ba59f…` done in 17 s, pushed `updated 1`; one file, one summary block; `search_notes` returned it at score 1 |
 | 2 | Mac asleep, then woken: the job completes, no duplicate | **Pass, by a different path than planned** | Job `459ce7db…` was leased in a DarkWake and the Mac slept 7 s into it. Lease lost (HTTP 409), note still pushed, job re-leased and completed; `done`, `attempts 2`, one note. See the DarkWake finding. |
 | 3 | A failing job ends `failed`, shows its error, is not retried | **Pass, with `example.com`, not an X link** | `2be15378…` `summarize_url`: `failed`, `attempts 1 of 3`, error "only 156 characters of text extracted…", log `exit 2 after 1s (permanent)`, no retry, no stray note. The X-link rejection (same exit 2, before any network call) is covered by the skill's own tests, not exercised through the Hub. |
 | 4 | Kill the worker mid-job: lease expires, job requeues after the retry delay, one note, summary intact | **Pass** | `f2b1750a…` `summarize_transcript` (`force`, `detailed`), Mac on AC power with no Sleep/DarkWake entry in the window. Leased 17:30:23, worker SIGKILLed 17:30:35 (12 s in), `queued` after the lease expired at 17:32:23 with "will retry in about 1m", re-leased 17:34:27, done 17:35:54 (87 s), pushed 17:35:58. `done`, `attempts 2`. One of 10 files; one summary block; the transcript sha256 and the frontmatter sha256 are identical to the copy taken before; the note was byte-identical after the killed attempt (nothing written); no `.tmp`, no orphan process. |
@@ -105,16 +105,20 @@ matters only if a note is edited somewhere that rewrites line endings. Fixing it
 | 6 | **Second-account refusal (hard gate)** | **NOT DONE** | The owner chose **option B** (temporarily wrong `ALLOWED_GITHUB_ID` on `fi-hub-auth`, then restored and verified as `12057985`), to be run by the fi-hub session. Result: `__ pending __`. Record it here when the owner reports it. |
 
 ### Not proven by the acceptance run
-- **Time until a new note is searchable.** The only searches ran against notes already in the
-  index, which return the note whatever the age of the new text, and the passage returned was
-  not the changed summary. A fair measurement needs a brand-new note and distinct queries.
-  fi-hub documents 70 to 90 s (HANDOFF section 9); not confirmed here.
 - **A job queued through a long, full sleep** (as opposed to a DarkWake). Not observed.
 - A transient failure retried twice and then `dead`, and a job or parameter not in the
   manifest being refused at enqueue (HANDOFF 11.12 item 3): not run in this pass.
 
 ### Confirmed afterwards
 - **Deduplication:** the owner sent the scenario 2 request twice; the Hub holds one job for it.
+- **Time until a new note is searchable** (a brand-new note, transcribe only, Mac awake on AC; local
+  time, 2026-11-01). Job `522ca7cd…` was created 18:03:35, leased 18:03:38 (+3 s), done 18:04:00
+  ("done in 22s"), pushed 18:04:03 (`inserted 1`), and **found by `search_notes` at 18:05:06**
+  (`cached: false`, the new note returned with its exact passage): **63 s after the push and 91 s
+  after the job was created.** One file, 11 notes on the Hub and in the vault. The first search
+  was already at +63 s and found it, so the true figure is at most that; fi-hub documents 70 to
+  90 s. A first measurement made earlier, against a note already in the index, proved nothing and
+  is not counted. The search quota used for the whole acceptance was 21 of 1000.
 
 ### Findings from the acceptance run
 - **`launchd` kills the skill with the worker.** Killing only the worker pid left no orphan
